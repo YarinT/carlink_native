@@ -149,3 +149,4 @@
 [82] :: Instr Cluster Nav Code Cleanup
 [83] :: Icon Thrashing fix, and more code cleanup
 [84] :: Log File export fixes
+[85] :: Testing Debug APK Only: Make app category 'HomeScreen' to replace GM Homescreen and freeup resources on GM Intel AAOS. Release APK: Instrument Cluster log level added

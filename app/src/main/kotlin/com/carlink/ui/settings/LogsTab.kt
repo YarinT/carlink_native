@@ -626,6 +626,7 @@ private fun LogLevelSelectorDialog(
             LogPreset.VIDEO_ONLY,
             LogPreset.AUDIO_ONLY,
             LogPreset.PIPELINE_DEBUG,
+            LogPreset.CLUSTER_MEDIA,
         )
 
     Dialog(onDismissRequest = onDismiss) {

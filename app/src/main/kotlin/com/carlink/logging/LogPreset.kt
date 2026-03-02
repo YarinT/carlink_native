@@ -53,6 +53,11 @@ enum class LogPreset(
         description = "Full video + audio pipeline debug",
         color = Color(0xFFA5D6A7), // green[200]
     ),
+    CLUSTER_MEDIA(
+        displayName = "Instrument Panel",
+        description = "Metadata for media and nav",
+        color = Color(0xFFBCAAA4), // brown[200]
+    ),
     ;
 
     companion object {
@@ -198,6 +203,26 @@ fun LogPreset.apply() {
                 true,
             )
             // Override release-build restriction for field diagnostics
+            Logger.setDebugLoggingEnabled(true)
+        }
+
+        LogPreset.CLUSTER_MEDIA -> {
+            Logger.setLogLevel(Logger.LogLevel.DEBUG, true)
+            Logger.setLogLevel(Logger.LogLevel.INFO, true)
+            Logger.setLogLevel(Logger.LogLevel.WARN, true)
+            Logger.setLogLevel(Logger.LogLevel.ERROR, true)
+            Logger.disableAllTags()
+            Logger.setTagsEnabled(
+                listOf(
+                    Logger.Tags.MEDIA,
+                    Logger.Tags.MEDIA_SESSION,
+                    Logger.Tags.NAVI,
+                    Logger.Tags.CLUSTER,
+                    Logger.Tags.ICON_SHIM,
+                    Logger.Tags.ADAPTR,
+                ),
+                true,
+            )
             Logger.setDebugLoggingEnabled(true)
         }
     }

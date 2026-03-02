@@ -30,7 +30,9 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Apps
 import androidx.compose.material.icons.filled.DisplaySettings
+import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.FullscreenExit
 import androidx.compose.material.icons.filled.Layers
@@ -73,6 +75,8 @@ import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import android.content.Intent
+import android.provider.Settings
 import com.carlink.BuildConfig
 import com.carlink.CarlinkManager
 import com.carlink.logging.FileLogManager
@@ -167,7 +171,7 @@ fun SettingsScreen(
                     containerColor = colorScheme.surface,
                 ) {
                     Spacer(modifier = Modifier.weight(1f))
-                    SettingsTab.entries.filter { !BuildConfig.DEBUG || it != SettingsTab.LOGS }.forEach { tab ->
+                    SettingsTab.visible.forEach { tab ->
                         NavigationRailItem(
                             selected = selectedTab == tab,
                             onClick = {
@@ -217,6 +221,7 @@ fun SettingsScreen(
             ) {
                 when (selectedTab) {
                     SettingsTab.CONTROL -> ControlTabContent(carlinkManager, onResetCluster)
+                    SettingsTab.HOME -> HomeTabContent()
                     SettingsTab.LOGS -> LogsTabContent(context, fileLogManager)
                 }
             }
@@ -509,6 +514,65 @@ private fun ControlTabContent(
         )
     }
 
+}
+
+/** Debug-only tab: launcher home settings. */
+@Composable
+private fun HomeTabContent() {
+    val context = LocalContext.current
+    val view = LocalView.current
+    val windowInfo = LocalWindowInfo.current
+    val density = LocalDensity.current
+    val containerWidthDp = with(density) { windowInfo.containerSize.width.toDp() }
+    val maxContentWidth = (containerWidthDp * 0.75f).coerceIn(400.dp, 1200.dp)
+
+    Box(
+        modifier = Modifier.fillMaxSize(),
+        contentAlignment = Alignment.TopCenter,
+    ) {
+        Column(
+            modifier =
+                Modifier
+                    .widthIn(max = maxContentWidth)
+                    .fillMaxWidth()
+                    .padding(24.dp),
+            verticalArrangement = Arrangement.spacedBy(24.dp),
+        ) {
+            ControlCard(
+                title = "Default Launcher",
+                icon = Icons.Default.Home,
+            ) {
+                Text(
+                    text = "CarLink is registered as a HOME launcher in this debug build. " +
+                        "Use the button below to open system home settings and set the default.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                FilledTonalButton(
+                    onClick = {
+                        view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                        context.startActivity(Intent(Settings.ACTION_HOME_SETTINGS))
+                    },
+                    modifier = Modifier.fillMaxWidth().height(AutomotiveDimens.ButtonMinHeight),
+                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Apps,
+                        contentDescription = "Open home settings",
+                        modifier = Modifier.size(AutomotiveDimens.IconSize),
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "Default Home App",
+                        style = MaterialTheme.typography.titleMedium,
+                    )
+                }
+            }
+        }
+    }
 }
 
 /**

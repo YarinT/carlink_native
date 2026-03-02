@@ -65,6 +65,14 @@ class MediaSessionManager(
     private var isPlaying: Boolean = false
     private var currentPosition: Long = 0L
 
+    // Dedup: last values pushed to MediaSession
+    private var lastPushedPlaying: Boolean? = null
+    private var lastPushedPositionMs: Long = 0L
+    private var lastPushedTimeNanos: Long = 0L
+
+    /** Position must drift more than this from AAOS-extrapolated value to trigger a push (seek). */
+    private val seekThresholdMs: Long = 2_000L
+
     // Album art bitmap cache — avoids redundant BitmapFactory.decodeByteArray on same cover
     private var cachedAlbumArtHash: Int = 0
     private var cachedBitmap: android.graphics.Bitmap? = null
@@ -155,6 +163,9 @@ class MediaSessionManager(
             mediaControlCallback = null
             cachedAlbumArtHash = 0
             cachedBitmap = null
+            lastPushedPlaying = null
+            lastPushedPositionMs = 0L
+            lastPushedTimeNanos = 0L
             log("[MEDIA_SESSION] Released")
         } catch (e: Exception) {
             log("[MEDIA_SESSION] Error during release: ${e.message}")
@@ -271,6 +282,21 @@ class MediaSessionManager(
             isPlaying = playing
             currentPosition = position
 
+            // Deduplicate: only push to MediaSession on actual state change or seek.
+            // AAOS extrapolates position from (position + speed * elapsed), so continuous
+            // position ticks during normal playback are redundant.
+            val stateChanged = playing != lastPushedPlaying
+            val now = System.nanoTime()
+            val elapsedMs = (now - lastPushedTimeNanos) / 1_000_000L
+            val expectedPosition = if (lastPushedPlaying == true) {
+                lastPushedPositionMs + elapsedMs
+            } else {
+                lastPushedPositionMs
+            }
+            val seekDetected = kotlin.math.abs(position - expectedPosition) > seekThresholdMs
+
+            if (!stateChanged && !seekDetected) return
+
             val state =
                 if (playing) {
                     PlaybackStateCompat.STATE_PLAYING
@@ -280,7 +306,11 @@ class MediaSessionManager(
 
             try {
                 session.setPlaybackState(buildPlaybackState(state, position))
-                log("[MEDIA_SESSION] Playback state: ${if (playing) "PLAYING" else "PAUSED"}")
+                lastPushedPlaying = playing
+                lastPushedPositionMs = position
+                lastPushedTimeNanos = now
+                val reason = if (stateChanged) "state change" else "seek"
+                log("[MEDIA_SESSION] Playback state: ${if (playing) "PLAYING" else "PAUSED"} ($reason, pos=${position}ms)")
             } catch (e: Exception) {
                 log("[MEDIA_SESSION] Failed to update playback state: ${e.message}")
             }
@@ -298,6 +328,9 @@ class MediaSessionManager(
             currentPosition = 0L
             cachedAlbumArtHash = 0
             cachedBitmap = null
+            lastPushedPlaying = null
+            lastPushedPositionMs = 0L
+            lastPushedTimeNanos = 0L
 
             try {
                 session.setPlaybackState(buildPlaybackState(PlaybackStateCompat.STATE_STOPPED))
