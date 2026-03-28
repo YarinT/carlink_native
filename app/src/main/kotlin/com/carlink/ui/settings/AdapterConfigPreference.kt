@@ -248,8 +248,6 @@ class AdapterConfigPreference private constructor(
             }
 
         // Preference keys
-        // Audio source: null = not configured, true = bluetooth, false = adapter
-        private val KEY_AUDIO_SOURCE_CONFIGURED = booleanPreferencesKey("audio_source_configured")
         private val KEY_AUDIO_SOURCE_BLUETOOTH = booleanPreferencesKey("audio_source_bluetooth")
 
         // Mic source: stored as command code (7=phone, 15=adapter)
@@ -286,7 +284,6 @@ class AdapterConfigPreference private constructor(
 
         // SharedPreferences keys for sync cache (ANR prevention)
         private const val SYNC_CACHE_PREFS_NAME = "carlink_adapter_config_sync_cache"
-        private const val SYNC_CACHE_KEY_AUDIO_CONFIGURED = "audio_source_configured"
         private const val SYNC_CACHE_KEY_AUDIO_BLUETOOTH = "audio_source_bluetooth"
         private const val SYNC_CACHE_KEY_MIC_SOURCE = "mic_source"
         private const val SYNC_CACHE_KEY_WIFI_BAND = "wifi_band"
@@ -746,7 +743,6 @@ class AdapterConfigPreference private constructor(
         try {
             // Clear DataStore
             dataStore.edit { preferences ->
-                preferences.remove(KEY_AUDIO_SOURCE_CONFIGURED)
                 preferences.remove(KEY_AUDIO_SOURCE_BLUETOOTH)
                 preferences.remove(KEY_MIC_SOURCE)
                 preferences.remove(KEY_WIFI_BAND)
@@ -765,7 +761,6 @@ class AdapterConfigPreference private constructor(
             syncCache
                 .edit()
                 .apply {
-                    remove(SYNC_CACHE_KEY_AUDIO_CONFIGURED)
                     remove(SYNC_CACHE_KEY_AUDIO_BLUETOOTH)
                     remove(SYNC_CACHE_KEY_MIC_SOURCE)
                     remove(SYNC_CACHE_KEY_WIFI_BAND)

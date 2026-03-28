@@ -228,6 +228,45 @@ class AdapterDriver(
     }
 
     /**
+     * Request the adapter to connect to a specific paired device by BT MAC address.
+     * Uses type 0x11 (AutoConnect_By_BluetoothAddress) H→A direction.
+     */
+    fun sendAutoConnectByBtAddress(btMac: String): Boolean {
+        log("[SEND] AutoConnect_By_BluetoothAddress: $btMac")
+        return send(MessageSerializer.serializeAutoConnectByBtAddress(btMac))
+    }
+
+    /**
+     * Request the adapter to forget/remove a device from its paired list.
+     * Moves the device from DevList to DeletedDevList, preventing auto-reconnect.
+     */
+    fun sendForgetBluetoothAddr(btMac: String): Boolean {
+        log("[SEND] ForgetBluetoothAddr: $btMac")
+        return send(MessageSerializer.serializeForgetBluetoothAddr(btMac))
+    }
+
+    /**
+     * Cancel the pending wifiConnect auto-connect timer and send a targeted
+     * AutoConnect_By_BluetoothAddress instead. Called when the user explicitly
+     * selects a device to connect to during a restart cycle.
+     */
+    fun overrideAutoConnectWithTarget(btMac: String): Boolean {
+        wifiConnectTimer?.cancel()
+        wifiConnectTimer = null
+        log("[SEND] Overriding auto-connect with targeted connect: $btMac")
+        return sendAutoConnectByBtAddress(btMac)
+    }
+
+    /**
+     * Request the adapter to send its current list of paired BT devices.
+     * Adapter responds with updated BoxSettings (0x19) containing DevList.
+     */
+    fun sendGetBtOnlineList(): Boolean {
+        log("[SEND] GetBluetoothOnlineList")
+        return sendCommand(CommandMapping.GET_BT_ONLINE_LIST)
+    }
+
+    /**
      * Send graceful teardown sequence. Must be called BEFORE stop()
      * since send() requires isRunning==true.
      *

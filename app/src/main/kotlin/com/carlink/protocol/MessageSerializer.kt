@@ -179,6 +179,44 @@ object MessageSerializer {
         return serializeWithPayload(MessageType.GNSS_DATA, payload)
     }
 
+    // ==================== Device Management Messages ====================
+
+    /** Validates a BT MAC address format: "XX:XX:XX:XX:XX:XX" (17 ASCII chars, hex + colons). */
+    private val BT_MAC_REGEX = Regex("^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
+
+    private fun requireValidMac(btMac: String) {
+        require(BT_MAC_REGEX.matches(btMac)) {
+            "Invalid BT MAC address format: \"$btMac\" (expected XX:XX:XX:XX:XX:XX)"
+        }
+    }
+
+    /**
+     * Serialize an AutoConnect_By_BluetoothAddress message (H→A).
+     * Tells the adapter to connect to a specific paired device by MAC address.
+     *
+     * Uses MessageType.WIFI_STATUS_DATA (0x11) — dual-purpose type:
+     * A→H = WiFi status data, H→A = AutoConnect_By_BluetoothAddress.
+     *
+     * @param btMac Bluetooth MAC address (format: "XX:XX:XX:XX:XX:XX")
+     */
+    fun serializeAutoConnectByBtAddress(btMac: String): ByteArray {
+        requireValidMac(btMac)
+        val payload = btMac.toByteArray(StandardCharsets.US_ASCII)
+        return serializeWithPayload(MessageType.WIFI_STATUS_DATA, payload)
+    }
+
+    /**
+     * Serialize a ForgetBluetoothAddr message (H→A).
+     * Tells the adapter to remove a device from its paired list (DevList → DeletedDevList).
+     *
+     * @param btMac Bluetooth MAC address (format: "XX:XX:XX:XX:XX:XX")
+     */
+    fun serializeForgetBluetoothAddr(btMac: String): ByteArray {
+        requireValidMac(btMac)
+        val payload = btMac.toByteArray(StandardCharsets.US_ASCII)
+        return serializeWithPayload(MessageType.FORGET_BLUETOOTH_ADDR, payload)
+    }
+
     // ==================== File Messages ====================
 
     /**

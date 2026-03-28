@@ -23,6 +23,7 @@ import com.carlink.protocol.AdapterConfig
 import com.carlink.protocol.AdapterDriver
 import com.carlink.protocol.AudioCommand
 import com.carlink.protocol.AudioDataMessage
+import com.carlink.protocol.BluetoothPairedListMessage
 import com.carlink.protocol.BoxSettingsMessage
 import com.carlink.protocol.CommandMapping
 import com.carlink.protocol.CommandMessage
@@ -132,6 +133,17 @@ class CarlinkManager(
     )
 
     /**
+     * Information about a paired device from the adapter's DevList.
+     */
+    data class DeviceInfo(
+        val btMac: String,
+        val name: String,
+        val type: String, // "CarPlay", "AndroidAuto", "HiCar"
+        val lastConnected: String? = null, // timestamp (CarPlay only)
+        val rfcomm: String? = null, // RFCOMM channel (CarPlay only)
+    )
+
+    /**
      * Callback interface for Carlink events.
      */
     interface Callback {
@@ -143,6 +155,32 @@ class CarlinkManager(
 
         /** Called when phone type becomes known (PLUGGED) or cleared (disconnect/error). */
         fun onPhoneTypeChanged(phoneType: PhoneType) {}
+
+        /** Called when the adapter's paired device list changes. */
+        fun onDeviceListChanged(devices: List<DeviceInfo>) {}
+    }
+
+    /**
+     * Listener for device management events (device list changes, connection state).
+     * Unlike [Callback], multiple listeners can be registered concurrently.
+     */
+    fun interface DeviceListener {
+        fun onDeviceListChanged(devices: List<DeviceInfo>)
+    }
+
+    private val deviceListeners = mutableListOf<DeviceListener>()
+
+    fun addDeviceListener(listener: DeviceListener) {
+        synchronized(deviceListeners) { deviceListeners.add(listener) }
+    }
+
+    fun removeDeviceListener(listener: DeviceListener) {
+        synchronized(deviceListeners) { deviceListeners.remove(listener) }
+    }
+
+    private fun notifyDeviceListeners() {
+        val snapshot = synchronized(deviceListeners) { deviceListeners.toList() }
+        snapshot.forEach { it.onDeviceListChanged(_deviceList) }
     }
 
     /**
@@ -261,7 +299,9 @@ class CarlinkManager(
     private var frameIntervalJob: Job? = null
 
     // Phone type tracking for keyframe request decisions
-    private var currentPhoneType: PhoneType? = null
+    /** Current phone type (CarPlay, Android Auto, etc.) from the PLUGGED message. Null when no phone connected. */
+    @Volatile var currentPhoneType: PhoneType? = null
+        private set
 
     // Auto-reconnect on USB disconnect
     private var reconnectJob: Job? = null
@@ -282,6 +322,14 @@ class CarlinkManager(
     // Phase 13 (negotiation_failed) — prevents auto-restart loop when iPhone rejects config
     private var negotiationRejected: Boolean = false
 
+    // Targeted connect: when set, the next restart() cycle sends AutoConnect_By_BtAddress
+    // instead of the normal WIFI_CONNECT (1002) auto-connect scan.
+    @Volatile private var pendingConnectTarget: String? = null
+
+    // Last targeted MAC — retained after pendingConnectTarget is consumed by start(),
+    // so PLUGGED handler can set _connectedBtMac even if PeerBluetoothAddress never arrives.
+    @Volatile private var lastConnectTargetMac: String? = null
+
     // Surface update debouncing - prevents repeated codec recreation during rapid surface size changes
     private var surfaceUpdateJob: Job? = null
     private var pendingSurface: Surface? = null
@@ -299,9 +347,19 @@ class CarlinkManager(
     private var lastPosition: Long = 0L
     private var lastIsPlaying: Boolean = true
 
-    // Device identification for SPS/PPS caching
-    private var deviceList: List<Pair<String, String>> = emptyList() // (btMac, type) from BoxSettings #1
-    private var connectedBtMac: String? = null // from PeerBluetoothAddress
+    // Device identification and management
+    @Volatile private var _deviceList: List<DeviceInfo> = emptyList()
+    @Volatile private var _connectedBtMac: String? = null // from PeerBluetoothAddress or BoxSettings #2
+
+    /** The adapter's list of paired wireless devices (from BoxSettings DevList). */
+    val pairedDevices: List<DeviceInfo> get() = _deviceList
+
+    /** BT MAC of the currently connected phone (null if none). */
+    val connectedBtMac: String? get() = _connectedBtMac
+
+    /** WiFi status from PluggedMessage: 0=USB wired, 1=wireless, null=unknown. */
+    @Volatile var currentWifi: Int? = null
+        private set
 
     /** Clears cached media metadata to prevent stale data on reconnect. */
     private fun clearCachedMediaMetadata() {
@@ -313,8 +371,8 @@ class CarlinkManager(
         lastDuration = 0L
         lastPosition = 0L
         lastIsPlaying = true
-        connectedBtMac = null
-        deviceList = emptyList()
+        _connectedBtMac = null
+        currentWifi = null
         NavigationStateManager.clear()
     }
 
@@ -713,7 +771,18 @@ class CarlinkManager(
 
         setStatusText("Initializing adapter...")
         val initSuccess = adapterDriver?.start(refreshedConfig, initMode.name, pendingChanges, actualSurfaceWidth, actualSurfaceHeight) ?: false
-        setStatusText("Waiting for phone...")
+
+        // If a targeted connect was requested (user selected a specific device),
+        // override the adapter's wifiConnect auto-connect timer with the target MAC.
+        val targetMac = pendingConnectTarget
+        if (targetMac != null) {
+            pendingConnectTarget = null
+            logInfo("[DEVICE_MGMT] Overriding auto-connect with targeted connect: $targetMac", tag = Logger.Tags.ADAPTR)
+            adapterDriver?.overrideAutoConnectWithTarget(targetMac)
+            setStatusText("Connecting to device...")
+        } else {
+            setStatusText("Waiting for phone...")
+        }
 
         // Mark first init completed, store version, and clear pending changes
         // ONLY clear pending changes if all init messages were sent successfully —
@@ -763,6 +832,7 @@ class CarlinkManager(
         consecutiveNoResponse = 0
         shortLivedStreamingCount = 0
         currentPhoneType = null // Clear phone type on disconnect
+        currentWifi = null
         videoPhoneTypeInferred = false
         codecDeferred = true // Reset for next connection
         videoEncoderType = 2 // Reset to H265/initial
@@ -810,6 +880,76 @@ class CarlinkManager(
         logInfo("[LIFECYCLE] disconnectPhone() — sending 0x0F to end phone session")
         scope.launch(Dispatchers.IO) {
             adapterDriver?.disconnectPhone()
+        }
+    }
+
+    // ==================== Device Management ====================
+
+    /**
+     * Request the adapter to send a fresh list of paired devices.
+     * The adapter responds with BoxSettings (0x19) containing an updated DevList.
+     * The UI is notified via [Callback.onDeviceListChanged].
+     */
+    fun refreshDeviceList() {
+        logInfo("[DEVICE_MGMT] Requesting fresh device list", tag = Logger.Tags.ADAPTR)
+        scope.launch(Dispatchers.IO) {
+            adapterDriver?.sendGetBtOnlineList()
+        }
+    }
+
+    /**
+     * Connect to a specific paired device by BT MAC address.
+     *
+     * If currently streaming, disconnects the active phone first and waits for
+     * the UNPLUGGED → restart cycle before sending the targeted connect.
+     * If idle, sends the connect request immediately.
+     *
+     * @param btMac Target device BT MAC (format: "XX:XX:XX:XX:XX:XX")
+     */
+    fun connectToDevice(btMac: String) {
+        logInfo("[DEVICE_MGMT] Connect to device: $btMac (current state=$state, wifi=$currentWifi)", tag = Logger.Tags.ADAPTR)
+
+        // Set the pending target BEFORE disconnecting so the UNPLUGGED → restart cycle
+        // sends AutoConnect_By_BtAddress instead of WIFI_CONNECT (1002).
+        pendingConnectTarget = btMac
+        lastConnectTargetMac = btMac
+
+        scope.launch(Dispatchers.IO) {
+            if (state == State.STREAMING || state == State.DEVICE_CONNECTED) {
+                logInfo("[DEVICE_MGMT] Disconnecting current phone before targeted connect to $btMac", tag = Logger.Tags.ADAPTR)
+                adapterDriver?.disconnectPhone()
+                // UNPLUGGED handler will call restart() which checks pendingConnectTarget
+            } else {
+                // Not currently connected — send targeted connect directly
+                val sent = adapterDriver?.sendAutoConnectByBtAddress(btMac) ?: false
+                logInfo("[DEVICE_MGMT] AutoConnect_By_BtAddress($btMac) sent=$sent (direct, no active session)", tag = Logger.Tags.ADAPTR)
+                pendingConnectTarget = null
+            }
+        }
+    }
+
+    /**
+     * Remove a device from the adapter's paired list (DevList → DeletedDevList).
+     * The adapter will no longer auto-connect to this device.
+     * Refreshes the device list after removal.
+     *
+     * @param btMac Target device BT MAC (format: "XX:XX:XX:XX:XX:XX")
+     */
+    fun forgetDevice(btMac: String) {
+        logInfo("[DEVICE_MGMT] Forget device: $btMac (list size=${_deviceList.size})", tag = Logger.Tags.ADAPTR)
+
+        // Optimistically remove from local list immediately for responsive UI.
+        // The adapter may take 10-20s to process and confirm via GET_BT_ONLINE_LIST.
+        _deviceList = _deviceList.filter { it.btMac != btMac }
+        callback?.onDeviceListChanged(_deviceList)
+        notifyDeviceListeners()
+
+        scope.launch(Dispatchers.IO) {
+            val sent = adapterDriver?.sendForgetBluetoothAddr(btMac) ?: false
+            logInfo("[DEVICE_MGMT] ForgetBluetoothAddr($btMac) sent=$sent", tag = Logger.Tags.ADAPTR)
+            // Refresh list from adapter to confirm removal (adapter response may be slow)
+            delay(1000)
+            adapterDriver?.sendGetBtOnlineList()
         }
     }
 
@@ -894,11 +1034,15 @@ class CarlinkManager(
         }
         codecDeferred = true // Reset for next connection
         currentPhoneType = null
+        currentWifi = null
+        pendingConnectTarget = null
+        lastConnectTargetMac = null
         callback?.onPhoneTypeChanged(PhoneType.UNKNOWN)
         activeVoiceMode = VoiceMode.NONE
         isSiriAudioActive = false
         isPhoneCallAudioActive = false
         isAlertAudioActive = false
+        clearCachedMediaMetadata()
         setState(State.DISCONNECTED)
     }
 
@@ -1134,14 +1278,14 @@ class CarlinkManager(
      */
     fun recoverVideoFromOverlay() {
         if (state != State.STREAMING) return
-        logInfo("[LIFECYCLE] Recovering video after overlay close", tag = Logger.Tags.VIDEO)
+        logInfo("[LIFECYCLE] Recovering video after overlay close (phoneType=$currentPhoneType)", tag = Logger.Tags.VIDEO)
         h264Renderer?.flushCodec()
-        // CarPlay: request keyframe — encoder teardown is invisible to user.
-        // AA: skip — FRAME command resets phone UI. Flushed codec will recover
-        // on next natural IDR or via watchdog/reactive keyframe.
-        if (currentPhoneType != PhoneType.ANDROID_AUTO) {
-            adapterDriver?.sendCommand(CommandMapping.FRAME)
-        }
+        // Request one keyframe for both CarPlay and AA.
+        // Periodic FRAME commands reset AA phone UI, but a single recovery keyframe
+        // after overlay close is necessary — the user is already seeing a frozen frame.
+        // Waiting for a natural IDR (~60s) leaves the UI visually unresponsive.
+        val sent = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
+        logDebug("[LIFECYCLE] Post-overlay keyframe request sent=$sent", tag = Logger.Tags.VIDEO)
     }
 
     // ==================== Private Methods ====================
@@ -1236,6 +1380,9 @@ class CarlinkManager(
     private fun handleMessage(message: Message) {
         when (message) {
             is PluggedMessage -> {
+                // Store wifi status for UI (0=USB, 1=wireless)
+                currentWifi = message.wifi
+
                 logInfo(
                     "[PLUGGED] Device plugged: phoneType=${message.phoneType}, wifi=${message.wifi}",
                     tag = Logger.Tags.VIDEO,
@@ -1260,6 +1407,61 @@ class CarlinkManager(
                 // Store phone type for keyframe request decisions during recovery
                 currentPhoneType = message.phoneType
                 logDebug("[PLUGGED] Stored currentPhoneType=$currentPhoneType", tag = Logger.Tags.VIDEO)
+
+                // Infer connected BT MAC if not yet known (adapter may not send
+                // PeerBluetoothAddress or BoxSettings #2 in every session).
+                if (_connectedBtMac == null) {
+                    // Priority 1: user explicitly selected this device via connectToDevice()
+                    val targetMac = lastConnectTargetMac
+                    if (targetMac != null) {
+                        _connectedBtMac = targetMac
+                        lastConnectTargetMac = null
+                        logInfo("[PLUGGED] Set connectedBtMac=$targetMac from user-selected target", tag = Logger.Tags.ADAPTR)
+                    } else if (_deviceList.isNotEmpty()) {
+                        // Priority 2: match PLUGGED phoneType against DevList entries by type
+                        val typeMatch = when (message.phoneType) {
+                            PhoneType.CARPLAY, PhoneType.CARPLAY_WIRELESS -> "CarPlay"
+                            PhoneType.ANDROID_AUTO -> "AndroidAuto"
+                            PhoneType.HI_CAR -> "HiCar"
+                            else -> null
+                        }
+                        if (typeMatch != null) {
+                            val matched = _deviceList.filter { it.type == typeMatch }
+                            if (matched.size == 1) {
+                                _connectedBtMac = matched[0].btMac
+                                logInfo("[PLUGGED] Inferred connectedBtMac=${_connectedBtMac} from DevList (type=$typeMatch)", tag = Logger.Tags.ADAPTR)
+                            } else {
+                                logDebug("[PLUGGED] Cannot infer MAC: ${matched.size} devices match type=$typeMatch", tag = Logger.Tags.ADAPTR)
+                            }
+                        }
+                    }
+                } else {
+                    // Already known — clear the target since connection succeeded
+                    lastConnectTargetMac = null
+                }
+
+                // Enrich device list: if connected device has unknown type (came from
+                // BluetoothPairedList which doesn't carry type), update it from PLUGGED phoneType.
+                val connMac = _connectedBtMac
+                if (connMac != null) {
+                    val typeStr = when (message.phoneType) {
+                        PhoneType.CARPLAY, PhoneType.CARPLAY_WIRELESS -> "CarPlay"
+                        PhoneType.ANDROID_AUTO -> "AndroidAuto"
+                        PhoneType.HI_CAR -> "HiCar"
+                        else -> null
+                    }
+                    if (typeStr != null) {
+                        val device = _deviceList.find { it.btMac == connMac }
+                        if (device != null && device.type.isEmpty()) {
+                            _deviceList = _deviceList.map {
+                                if (it.btMac == connMac) it.copy(type = typeStr) else it
+                            }
+                            logInfo("[PLUGGED] Enriched device $connMac type → $typeStr", tag = Logger.Tags.ADAPTR)
+                            callback?.onDeviceListChanged(_deviceList)
+                            notifyDeviceListeners()
+                        }
+                    }
+                }
 
                 // Set AA mode on renderer for AA-specific behaviors:
                 // first-frame skip, frame cache replay, crop scaling mode
@@ -1384,7 +1586,7 @@ class CarlinkManager(
                     val phoneModel = message.json.optString("MDModel", "").ifEmpty { null }
                     val btMac = message.json.optString("btMacAddr", "").ifEmpty { null }
                     if (btMac != null) {
-                        connectedBtMac = btMac
+                        _connectedBtMac = btMac
                         tryPrestageCodecCsd(btMac)
                     }
                     // Phone link metadata (sent after phone connects)
@@ -1402,23 +1604,32 @@ class CarlinkManager(
                     )
                 } else {
                     // BoxSettings #1: adapter info — has DevList of previously paired devices
-                    deviceList = parseDevList(message.json)
+                    _deviceList = parseDevList(message.json)
+                    callback?.onDeviceListChanged(_deviceList)
+                    notifyDeviceListeners()
                     // Adapter capabilities
                     val hiCar = message.json.optInt("HiCar", -1).takeIf { it >= 0 }
                     val supportFeatures = message.json.optString("supportFeatures", "").ifEmpty { null }
                     val channelList = message.json.optString("ChannelList", "").ifEmpty { null }
                     logInfo(
-                        "[DEVICE] Paired devices: ${deviceList.size}" +
+                        "[DEVICE] Paired devices: ${_deviceList.size}" +
                             (if (hiCar != null) ", HiCar=$hiCar" else "") +
                             (if (supportFeatures != null) ", features=$supportFeatures" else "") +
                             (if (channelList != null) ", channels=$channelList" else ""),
                         tag = Logger.Tags.ADAPTR,
                     )
+                    _deviceList.forEachIndexed { idx, dev ->
+                        logDebug(
+                            "[DEVICE] DevList[$idx]: mac=${dev.btMac}, name=${dev.name}, " +
+                                "type=${dev.type}, last=${dev.lastConnected ?: "n/a"}",
+                            tag = Logger.Tags.ADAPTR,
+                        )
+                    }
                     // Hot-rejoin: if exactly 1 paired device, try cache lookup now
                     // (adapter may skip BoxSettings #2 and PeerBluetoothAddress)
-                    if (deviceList.size == 1) {
-                        val (mac, _) = deviceList[0]
-                        connectedBtMac = mac
+                    if (_deviceList.size == 1) {
+                        val mac = _deviceList[0].btMac
+                        _connectedBtMac = mac
                         tryPrestageCodecCsd(mac)
                     }
                 }
@@ -1451,7 +1662,7 @@ class CarlinkManager(
             }
 
             is PeerBluetoothAddressMessage -> {
-                connectedBtMac = message.macAddress
+                _connectedBtMac = message.macAddress
                 logInfo("[DEVICE] Peer BT address: ${message.macAddress}", tag = Logger.Tags.ADAPTR)
                 tryPrestageCodecCsd(message.macAddress)
             }
@@ -1508,6 +1719,50 @@ class CarlinkManager(
 
             is SessionTokenMessage -> {
                 logDebug("[SESSION] Token received (${message.payloadSize}B encrypted)", tag = Logger.Tags.ADAPTR)
+            }
+
+            is BluetoothPairedListMessage -> {
+                logInfo(
+                    "[DEVICE] BluetoothPairedList: ${message.devices.size} devices (existing=${_deviceList.size})",
+                    tag = Logger.Tags.ADAPTR,
+                )
+                if (message.devices.isNotEmpty()) {
+                    // MERGE into existing list — 0x12 is sent multiple times:
+                    // at init (all devices) and after BT connect (just the connecting device).
+                    // Never shrink the list; only add/update entries.
+                    // BoxSettings DevList (0x19) is the authoritative full list.
+                    val existingByMac = _deviceList.associateBy { it.btMac }.toMutableMap()
+                    var changed = false
+                    for ((mac, name) in message.devices) {
+                        val existing = existingByMac[mac]
+                        if (existing != null) {
+                            // Update name if changed
+                            if (existing.name != name) {
+                                existingByMac[mac] = existing.copy(name = name)
+                                changed = true
+                            }
+                        } else {
+                            // New device not in current list
+                            existingByMac[mac] = DeviceInfo(
+                                btMac = mac,
+                                name = name,
+                                type = "", // Unknown from 0x12 — enriched when BoxSettings arrives
+                            )
+                            changed = true
+                        }
+                    }
+                    if (changed || _deviceList.isEmpty()) {
+                        _deviceList = existingByMac.values.toList()
+                        _deviceList.forEachIndexed { idx, dev ->
+                            logDebug(
+                                "[DEVICE] PairedList[$idx]: mac=${dev.btMac}, name=${dev.name}, type=${dev.type.ifEmpty { "unknown" }}",
+                                tag = Logger.Tags.ADAPTR,
+                            )
+                        }
+                        callback?.onDeviceListChanged(_deviceList)
+                        notifyDeviceListeners()
+                    }
+                }
             }
 
             is InfoMessage -> {
@@ -1936,7 +2191,10 @@ class CarlinkManager(
         // Full session state reset (mirrors stop() minus cancelReconnect/graceful teardown)
         cancelDelayedKeyframe()
         negotiationRejected = false
+        pendingConnectTarget = null
+        lastConnectTargetMac = null
         currentPhoneType = null
+        currentWifi = null
         videoPhoneTypeInferred = false
         codecDeferred = true
         videoEncoderType = 2
@@ -2265,13 +2523,19 @@ class CarlinkManager(
         h264Renderer?.configureWithCsd(sps, pps)
     }
 
-    private fun parseDevList(json: JSONObject): List<Pair<String, String>> {
+    private fun parseDevList(json: JSONObject): List<DeviceInfo> {
         val arr = json.optJSONArray("DevList") ?: return emptyList()
         return (0 until arr.length()).mapNotNull { i ->
             val obj = arr.optJSONObject(i) ?: return@mapNotNull null
             val id = obj.optString("id", "")
-            val type = obj.optString("type", "")
-            if (id.isNotEmpty()) Pair(id, type) else null
+            if (id.isEmpty()) return@mapNotNull null
+            DeviceInfo(
+                btMac = id,
+                name = obj.optString("name", id), // fallback to MAC if no name
+                type = obj.optString("type", ""),
+                lastConnected = obj.optString("time", "").ifEmpty { null },
+                rfcomm = obj.optString("rfcomm", "").ifEmpty { null },
+            )
         }
     }
 

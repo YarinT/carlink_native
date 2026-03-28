@@ -89,7 +89,7 @@ object MessageParser {
 
             MessageType.BLUETOOTH_PIN -> parseStringPayload(header, payload, "BluetoothPin")
 
-            MessageType.BLUETOOTH_PAIRED_LIST -> parseStringPayload(header, payload, "BluetoothPairedList")
+            MessageType.BLUETOOTH_PAIRED_LIST -> parseBluetoothPairedList(header, payload)
 
             MessageType.MANUFACTURER_INFO -> parseStringPayload(header, payload, "ManufacturerInfo")
 
@@ -125,6 +125,8 @@ object MessageParser {
             MessageType.DASHBOARD_DATA -> parseHexPayload(header, payload, "DashboardData")
 
             MessageType.WIFI_STATUS_DATA -> parseHexPayload(header, payload, "WiFiStatusData")
+
+            MessageType.FORGET_BLUETOOTH_ADDR -> parseStringPayload(header, payload, "ForgetBluetoothAddr")
 
             MessageType.DISK_INFO -> parseStringPayload(header, payload, "DiskInfo")
 
@@ -384,6 +386,45 @@ object MessageParser {
         return StatusValueMessage(header, buffer.int)
     }
 
+    /**
+     * Parse BluetoothPairedList (0x12).
+     *
+     * The adapter sends paired devices as concatenated MAC+Name strings.
+     * Entries may or may not be null-separated. The MAC pattern (XX:XX:XX:XX:XX:XX)
+     * is used as a reliable delimiter to split entries.
+     *
+     * Example payloads:
+     *   "64:31:35:8C:29:69Luis"                          — single device
+     *   "64:31:35:8C:29:69Zeno\0B0:D5:FB:A3:7E:AAPixel"  — null-separated
+     *   "64:31:35:8C:29:69ZenoB0:D5:FB:A3:7E:AAPixel 10" — no separator
+     */
+    private val BT_MAC_PATTERN = Regex("[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}")
+
+    private fun parseBluetoothPairedList(
+        header: MessageHeader,
+        payload: ByteArray?,
+    ): Message {
+        if (payload == null || header.length < 17) {
+            return BluetoothPairedListMessage(header, "", emptyList())
+        }
+        val raw = String(payload, 0, header.length, StandardCharsets.UTF_8)
+            .replace(Regex("[\\x00-\\x1F\\x7F]+"), "") // strip all control characters
+        val devices = mutableListOf<Pair<String, String>>()
+
+        // Find all MAC addresses in the string — each starts a new device entry
+        val macMatches = BT_MAC_PATTERN.findAll(raw).toList()
+        for ((idx, match) in macMatches.withIndex()) {
+            val mac = match.value
+            val nameStart = match.range.last + 1
+            // Name runs from after MAC to the start of the next MAC (or end of string)
+            val nameEnd = if (idx + 1 < macMatches.size) macMatches[idx + 1].range.first else raw.length
+            val name = raw.substring(nameStart, nameEnd).trim().ifEmpty { mac }
+            devices.add(Pair(mac, name))
+        }
+
+        return BluetoothPairedListMessage(header, raw, devices)
+    }
+
     private fun parseStringPayload(
         header: MessageHeader,
         payload: ByteArray?,
@@ -615,6 +656,19 @@ class StatusValueMessage(
     val value: Int,
 ) : Message(header) {
     override fun toString(): String = "StatusValue($value / 0x${value.toString(16)})"
+}
+
+/**
+ * Parsed Bluetooth paired device list (0x12).
+ * Payload format: "MAC1Name1\u0000MAC2Name2\u0000..." or "MAC1Name1" single entry.
+ * MAC is 17 chars ("XX:XX:XX:XX:XX:XX"), remainder is the device name.
+ */
+class BluetoothPairedListMessage(
+    header: MessageHeader,
+    val rawPayload: String,
+    val devices: List<Pair<String, String>>, // (btMac, name)
+) : Message(header) {
+    override fun toString(): String = "BluetoothPairedList(${devices.size} devices: ${devices.joinToString { "${it.second}(${it.first})" }})"
 }
 
 /**

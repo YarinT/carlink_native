@@ -1,18 +1,4 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <application>
-        <activity android:name=".MainActivity"
-            android:exported="true">
-            <!-- Debug-only: register as a HOME launcher candidate.
-                 Use ADB to activate: cmd role add-role-holder android.app.role.HOME zeno.carlink
-                 Revert: cmd role add-role-holder android.app.role.HOME <gm.launcher.package> -->
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.HOME" />
-                <category android:name="android.intent.category.DEFAULT" />
-            </intent-filter>
-        </activity>
-    </application>
-
 </manifest>

@@ -1,8 +1,6 @@
 package com.carlink.ui
 
-import android.content.Intent
 import android.content.pm.PackageManager
-import android.provider.Settings
 import android.view.HapticFeedbackConstants
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.fadeIn
@@ -32,11 +30,9 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.Apps
 import androidx.compose.material.icons.filled.DisplaySettings
 import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.FullscreenExit
-import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.PhoneDisabled
 import androidx.compose.material.icons.filled.PowerOff
@@ -88,6 +84,7 @@ import com.carlink.ui.settings.DisplayMode
 import com.carlink.ui.settings.DisplayModeDialog
 import com.carlink.ui.settings.DisplayModePreference
 import com.carlink.ui.settings.LogsTabContent
+import com.carlink.ui.settings.PhonesTabContent
 import com.carlink.ui.settings.SettingsTab
 import com.carlink.ui.theme.AutomotiveDimens
 import kotlinx.coroutines.launch
@@ -101,7 +98,7 @@ fun SettingsScreen(
     onResetCluster: () -> Unit,
     onReinitForDisplayMode: (DisplayMode) -> Unit = {},
 ) {
-    var selectedTab by remember { mutableStateOf(SettingsTab.CONTROL) }
+    var selectedTab by remember { mutableStateOf(SettingsTab.PHONES) }
     val context = LocalContext.current
     val colorScheme = MaterialTheme.colorScheme
 
@@ -221,7 +218,7 @@ fun SettingsScreen(
             ) {
                 when (selectedTab) {
                     SettingsTab.CONTROL -> ControlTabContent(carlinkManager, onResetCluster, onReinitForDisplayMode)
-                    SettingsTab.HOME -> HomeTabContent()
+                    SettingsTab.PHONES -> PhonesTabContent(carlinkManager)
                     SettingsTab.LOGS -> LogsTabContent(context, fileLogManager)
                 }
             }
@@ -520,66 +517,6 @@ private fun ControlTabContent(
                 }
             },
         )
-    }
-}
-
-/** Debug-only tab: launcher home settings. */
-@Composable
-private fun HomeTabContent() {
-    val context = LocalContext.current
-    val view = LocalView.current
-    val windowInfo = LocalWindowInfo.current
-    val density = LocalDensity.current
-    val containerWidthDp = with(density) { windowInfo.containerSize.width.toDp() }
-    val maxContentWidth = (containerWidthDp * 0.75f).coerceIn(400.dp, 1200.dp)
-
-    Box(
-        modifier = Modifier.fillMaxSize(),
-        contentAlignment = Alignment.TopCenter,
-    ) {
-        Column(
-            modifier =
-                Modifier
-                    .widthIn(max = maxContentWidth)
-                    .fillMaxWidth()
-                    .padding(24.dp),
-            verticalArrangement = Arrangement.spacedBy(24.dp),
-        ) {
-            ControlCard(
-                title = "Default Launcher",
-                icon = Icons.Default.Home,
-            ) {
-                Text(
-                    text =
-                        "CarLink is registered as a HOME launcher in this debug build. " +
-                            "Use the button below to open system home settings and set the default.",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-
-                Spacer(modifier = Modifier.height(16.dp))
-
-                FilledTonalButton(
-                    onClick = {
-                        view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
-                        context.startActivity(Intent(Settings.ACTION_HOME_SETTINGS))
-                    },
-                    modifier = Modifier.fillMaxWidth().height(AutomotiveDimens.ButtonMinHeight),
-                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Apps,
-                        contentDescription = "Open home settings",
-                        modifier = Modifier.size(AutomotiveDimens.IconSize),
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        text = "Default Home App",
-                        style = MaterialTheme.typography.titleMedium,
-                    )
-                }
-            }
-        }
     }
 }
 

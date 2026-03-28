@@ -245,6 +245,7 @@ enum class MessageType(
     HI_CAR_LINK(0x18),
     PEER_BLUETOOTH_ADDRESS(0x23), // Binary: Bluetooth_ConnectStart — BT connection started, carries peer MAC
     PEER_BLUETOOTH_ADDRESS_ALT(0x24), // Binary: Bluetooth_Connected — BT connected, carries peer MAC
+    FORGET_BLUETOOTH_ADDR(0x22), // BOTH: Remove/forget a BT address from adapter's paired list (MAC payload)
     UI_HIDE_PEER_INFO(0x25), // Binary: Bluetooth_DisConnect — BT disconnected / hide peer info
     UI_BRING_TO_FOREGROUND(0x26), // Binary: Bluetooth_Listen — BT listening/advertising / bring to foreground
 
@@ -264,7 +265,7 @@ enum class MessageType(
     // Additional Adapter→Host Messages (Firmware Binary Analysis)
     CARPLAY_CONTROL(0x0B), // CMD_ACK / CarPlay control acknowledgment
     DASHBOARD_DATA(0x10), // Dashboard/instrument cluster data (DashBoard_DATA)
-    WIFI_STATUS_DATA(0x11), // WiFi status information
+    WIFI_STATUS_DATA(0x11), // A→H: WiFi status info; H→A: AutoConnect_By_BluetoothAddress (MAC payload)
     DISK_INFO(0x13), // Adapter disk/storage information
     DEVICE_EXTENDED_INFO(0x1B), // Extended device information
     REMOTE_CX_CY(0x1E), // Display resolution broadcast from adapter
