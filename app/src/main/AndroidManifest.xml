@@ -104,17 +104,7 @@
             </intent-filter>
         </service>
 
-        <!-- ClusterIconShimProvider: claims the orphaned Templates Host authority so
-             maneuver icons are delivered to the instrument cluster. Without this
-             declaration the system never registers the authority and Templates Host
-             permanently sets skipIcons=true on the first failed insert(). -->
-        <provider
-            android:name=".provider.ClusterIconShimProvider"
-            android:authorities="com.google.android.apps.automotive.templates.host.ClusterIconContentProvider"
-            android:exported="true"
-            android:grantUriPermissions="true" />
-
-        <!-- APPLICATION-LEVEL DISTRACTION OPTIMIZATION DECLARATION -->
+<!-- APPLICATION-LEVEL DISTRACTION OPTIMIZATION DECLARATION -->
         <meta-data
             android:name="com.android.automotive.application.DISTRACTION_OPTIMIZED"
             android:value="true" />
