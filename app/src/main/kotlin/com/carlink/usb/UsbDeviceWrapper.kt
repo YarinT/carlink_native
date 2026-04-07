@@ -11,20 +11,13 @@ import android.hardware.usb.UsbEndpoint
 import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
 import androidx.core.content.ContextCompat
-import com.carlink.logging.Logger
-import com.carlink.logging.logDebug
-import com.carlink.logging.logWarn
 import com.carlink.protocol.KnownDevices
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.resume
 
 private const val ACTION_USB_PERMISSION = "com.carlink.USB_PERMISSION"
-private const val MAX_PAYLOAD_SIZE = 2 * 1024 * 1024 // 2MB — reject corrupted headers
-private const val INITIAL_RESPONSE_TIMEOUT_MS = 15_000L // adapter must respond within 15s of reading loop start
 
 /**
  * USB Device Wrapper for Carlinkit Adapter Communication
@@ -34,6 +27,8 @@ private const val INITIAL_RESPONSE_TIMEOUT_MS = 15_000L // adapter must respond 
  * - Connection lifecycle management
  * - Bulk transfer operations for data exchange
  * - Interface claiming and endpoint configuration
+ *
+ * Ported from: lib/driver/usb/usb_device_wrapper.dart
  */
 class UsbDeviceWrapper(
     private val context: Context,
@@ -49,8 +44,6 @@ class UsbDeviceWrapper(
     private val _isOpened = AtomicBoolean(false)
     private val _isReadingLoopActive = AtomicBoolean(false)
 
-    @Volatile private var readLoopThread: Thread? = null
-
     val isOpened: Boolean get() = _isOpened.get()
     val isReadingLoopActive: Boolean get() = _isReadingLoopActive.get()
 
@@ -58,14 +51,13 @@ class UsbDeviceWrapper(
     val productId: Int get() = device.productId
     val deviceName: String get() = device.deviceName
 
-    // Performance tracking — atomic because write() is called from multiple threads
-    // (heartbeat timer, mic capture timer, frame interval coroutine, UI thread)
-    private val bytesSent = AtomicLong(0)
-    private val bytesReceived = AtomicLong(0)
-    private val sendCount = AtomicInteger(0)
-    private val receiveCount = AtomicInteger(0)
-    private val sendErrors = AtomicInteger(0)
-    private val receiveErrors = AtomicInteger(0)
+    // Performance tracking
+    private var bytesSent: Long = 0
+    private var bytesReceived: Long = 0
+    private var sendCount: Int = 0
+    private var receiveCount: Int = 0
+    private var sendErrors: Int = 0
+    private var receiveErrors: Int = 0
 
     /**
      * Check if we have permission to access the USB device.
@@ -223,10 +215,27 @@ class UsbDeviceWrapper(
         connection = null
         _isOpened.set(false)
 
-        log(
-            "Device closed (sent: ${sendCount.get()}/${bytesSent.get()} bytes, " +
-                "received: ${receiveCount.get()}/${bytesReceived.get()} bytes)",
-        )
+        log("Device closed (sent: $sendCount/$bytesSent bytes, received: $receiveCount/$bytesReceived bytes)")
+    }
+
+    /**
+     * Reset the USB device.
+     *
+     * @return true if reset was successful
+     */
+    fun reset(): Boolean {
+        val conn = connection ?: return false
+
+        return try {
+            // Note: controlTransfer with USB_DEVICE_RESET is not directly available
+            // Using close/reopen pattern for reset
+            close()
+            Thread.sleep(500)
+            open()
+        } catch (e: Exception) {
+            log("Device reset failed: ${e.message}")
+            false
+        }
     }
 
     /**
@@ -255,14 +264,14 @@ class UsbDeviceWrapper(
         return try {
             val result = conn.bulkTransfer(endpoint, data, data.size, timeout)
             if (result >= 0) {
-                bytesSent.addAndGet(result.toLong())
-                sendCount.incrementAndGet()
+                bytesSent += result
+                sendCount++
             } else {
-                sendErrors.incrementAndGet()
+                sendErrors++
             }
             result
         } catch (e: Exception) {
-            sendErrors.incrementAndGet()
+            sendErrors++
             log("Write error: ${e.message}")
             -1
         }
@@ -294,15 +303,15 @@ class UsbDeviceWrapper(
         return try {
             val result = conn.bulkTransfer(endpoint, buffer, buffer.size, timeout)
             if (result >= 0) {
-                bytesReceived.addAndGet(result.toLong())
-                receiveCount.incrementAndGet()
+                bytesReceived += result
+                receiveCount++
             } else if (result != -1) {
                 // -1 is timeout, not an error
-                receiveErrors.incrementAndGet()
+                receiveErrors++
             }
             result
         } catch (e: Exception) {
-            receiveErrors.incrementAndGet()
+            receiveErrors++
             log("Read error: ${e.message}")
             -1
         }
@@ -310,21 +319,18 @@ class UsbDeviceWrapper(
 
     /**
      * Callback interface for direct video data processing.
-     * [DIRECT_HANDOFF]: Data is already read into a buffer by the read loop.
-     * Processor receives the buffer directly — no callback, no copy.
+     * This enables zero-copy video data handling similar to Flutter's processDataDirect pattern.
      */
     interface VideoDataProcessor {
         /**
-         * Process video data directly. Data is valid only for duration of this call.
+         * Process video data directly from USB.
          *
-         * @param data Buffer containing video payload (including 20-byte video header)
-         * @param dataLength Actual bytes read into data
-         * @param sourcePtsMs Source presentation timestamp in milliseconds from video header
+         * @param payloadLength Total payload length (including 20-byte video header)
+         * @param readCallback Callback to read data into the provided buffer
          */
         fun processVideoDirect(
-            data: ByteArray,
-            dataLength: Int,
-            sourcePtsMs: Int,
+            payloadLength: Int,
+            readCallback: (buffer: ByteArray, offset: Int, length: Int) -> Int,
         )
     }
 
@@ -335,7 +341,6 @@ class UsbDeviceWrapper(
         fun onMessage(
             type: Int,
             data: ByteArray?,
-            dataLength: Int,
         )
 
         fun onError(error: String)
@@ -359,33 +364,8 @@ class UsbDeviceWrapper(
         }
 
         Thread {
-            // Elevate thread priority: USB read feeds BOTH audio and video pipelines
-            // Must be >= video codec priority to prevent audio underruns from data starvation
-            // Using -10 (between URGENT_DISPLAY=-8 and AUDIO=-16) to match MediaCodec_loop priority
-            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY - 2)
-
             log("Reading loop started")
             val headerBuffer = ByteArray(16)
-
-            // Pre-allocate video buffer to avoid per-frame allocation (reduces GC pressure at 60fps)
-            // Initial size 256KB covers most frames; grows if needed (rare for 1080p H.264)
-            var videoBuffer = ByteArray(256 * 1024)
-
-            // Pre-allocate audio buffer to avoid per-packet allocation (~17 packets/sec)
-            // Initial size 16KB covers typical 11532-byte audio payloads; grows if needed
-            var audioBuffer = ByteArray(16 * 1024)
-
-            // Pre-allocate chunk buffer for non-video message reads (audio, commands, etc.)
-            val chunkBuffer = ByteArray(16384)
-
-            // Timeout detection: two separate checks —
-            // 1. Initial response: adapter MUST respond to Open within INITIAL_RESPONSE_TIMEOUT_MS.
-            //    If no data arrives at all, the USB IN endpoint is dead (adapter can't write).
-            // 2. Mid-session silence: if data was flowing and stops, adapter disconnected/stalled.
-            var hasReceivedData = false
-            var consecutiveTimeouts = 0
-            val maxConsecutiveTimeouts = 2 // 2 × 30s timeout = 60s of mid-session silence
-            val initialResponseDeadline = System.currentTimeMillis() + INITIAL_RESPONSE_TIMEOUT_MS
 
             try {
                 while (_isReadingLoopActive.get() && _isOpened.get()) {
@@ -394,29 +374,7 @@ class UsbDeviceWrapper(
                     if (headerResult != 16) {
                         if (_isReadingLoopActive.get()) {
                             if (headerResult == -1) {
-                                if (!hasReceivedData) {
-                                    // No data ever received — check initial response deadline
-                                    if (System.currentTimeMillis() >= initialResponseDeadline) {
-                                        log(
-                                            "Adapter not responding: no data received within " +
-                                                "${INITIAL_RESPONSE_TIMEOUT_MS / 1000}s of connection — " +
-                                                "USB IN endpoint may be dead",
-                                        )
-                                        callback.onError("USB read timeout — no initial response from adapter")
-                                        break
-                                    }
-                                } else {
-                                    // Was receiving data, now silent — adapter disconnected?
-                                    consecutiveTimeouts++
-                                    if (consecutiveTimeouts >= maxConsecutiveTimeouts) {
-                                        log(
-                                            "Adapter silent: $consecutiveTimeouts consecutive timeouts " +
-                                                "(${consecutiveTimeouts * timeout / 1000}s) after data was flowing",
-                                        )
-                                        callback.onError("USB read timeout — adapter not responding")
-                                        break
-                                    }
-                                }
+                                // Timeout - continue loop
                                 continue
                             }
                             log("Incomplete header read: $headerResult bytes")
@@ -424,158 +382,89 @@ class UsbDeviceWrapper(
                         continue
                     }
 
-                    // Successful header read — reset timeout counter
-                    consecutiveTimeouts = 0
-                    hasReceivedData = true
-
                     // Parse header
                     val header =
                         try {
                             com.carlink.protocol.MessageParser
                                 .parseHeader(headerBuffer)
                         } catch (e: com.carlink.protocol.HeaderParseException) {
-                            val hex = headerBuffer.take(16).joinToString(" ") { "%02X".format(it) }
-                            logWarn(
-                                "Header parse error: ${e.message} raw=[$hex]",
-                                tag = com.carlink.logging.Logger.Tags.PROTO_UNKNOWN,
-                            )
+                            log("Header parse error: ${e.message}")
                             continue
                         }
 
-                    // Reject corrupted headers with implausible payload sizes
-                    if (header.length > MAX_PAYLOAD_SIZE) {
-                        val hex = headerBuffer.take(16).joinToString(" ") { "%02X".format(it) }
-                        logWarn(
-                            "Corrupted header: length=${header.length} exceeds max raw=[$hex]",
-                            tag = com.carlink.logging.Logger.Tags.PROTO_UNKNOWN,
-                        )
-                        continue
-                    }
-
-                    // Handle VIDEO_DATA and NAVI_VIDEO_DATA with direct handoff to codec
-                    if ((
-                            header.type == com.carlink.protocol.MessageType.VIDEO_DATA ||
-                                header.type == com.carlink.protocol.MessageType.NAVI_VIDEO_DATA
-                        ) &&
+                    // Handle VIDEO_DATA specially with direct processing for zero-copy performance
+                    // This bypasses message parsing and writes directly to the renderer's ring buffer
+                    if (header.type == com.carlink.protocol.MessageType.VIDEO_DATA &&
                         header.length > 0 && videoProcessor != null
                     ) {
+                        // Direct video processing - read USB data directly into ring buffer
+                        // CRITICAL: Wrap in try-catch to prevent exceptions from crashing reading loop
+                        // which would trigger disconnect and session close
                         val conn = connection
                         val endpoint = inEndpoint
                         if (conn != null && endpoint != null) {
                             try {
-                                // Reuse pre-allocated buffer; grow only if needed (rare)
-                                if (videoBuffer.size < header.length) {
-                                    videoBuffer = ByteArray(maxOf(header.length, videoBuffer.size * 2))
-                                }
-                                var totalRead = 0
-                                var readAttempts = 0
-                                var lastChunkResult = 0
-
-                                while (totalRead < header.length && _isReadingLoopActive.get()) {
-                                    val remaining = header.length - totalRead
-                                    val chunkSize = minOf(remaining, 16384)
-                                    readAttempts++
-                                    val chunkRead =
-                                        conn.bulkTransfer(
-                                            endpoint,
-                                            videoBuffer,
-                                            totalRead,
-                                            chunkSize,
-                                            timeout,
-                                        )
-                                    lastChunkResult = chunkRead
-                                    if (chunkRead > 0) {
-                                        totalRead += chunkRead
-                                        bytesReceived.addAndGet(chunkRead.toLong())
-                                        receiveCount.incrementAndGet()
-                                    } else if (chunkRead <= 0) {
-                                        logDebug(
-                                            "[VIDEO_READ] Read failed: attempts=$readAttempts, " +
-                                                "got=$totalRead/${header.length}, lastResult=$chunkRead",
-                                            tag = Logger.Tags.VIDEO_USB,
-                                        )
-                                        break
+                                videoProcessor.processVideoDirect(header.length) { buffer, offset, length ->
+                                    // Read chunks directly into the provided buffer
+                                    var totalRead = 0
+                                    while (totalRead < length && _isReadingLoopActive.get()) {
+                                        val remaining = length - totalRead
+                                        val chunkSize = minOf(remaining, 16384)
+                                        val chunkRead =
+                                            conn.bulkTransfer(
+                                                endpoint,
+                                                buffer,
+                                                offset + totalRead,
+                                                chunkSize,
+                                                timeout,
+                                            )
+                                        if (chunkRead > 0) {
+                                            totalRead += chunkRead
+                                            bytesReceived += chunkRead
+                                            receiveCount++
+                                        } else if (chunkRead <= 0) {
+                                            break
+                                        }
                                     }
+                                    totalRead
                                 }
 
-                                // Extract source PTS from video header (offset 12) if we have enough data
-                                val sourcePts =
-                                    if (totalRead >= 16) {
-                                        extractPtsFromHeader(videoBuffer)
-                                    } else {
-                                        logDebug(
-                                            "[VIDEO_READ] Incomplete read for PTS: got=$totalRead bytes, need>=16",
-                                            tag = Logger.Tags.VIDEO_USB,
-                                        )
-                                        0
-                                    }
-
-                                if (totalRead == header.length) {
-                                    videoProcessor.processVideoDirect(videoBuffer, totalRead, sourcePts)
-                                } else {
-                                    logDebug(
-                                        "[VIDEO_READ] Partial frame dropped: got=$totalRead/${header.length} " +
-                                            "attempts=$readAttempts, lastResult=$lastChunkResult",
-                                        tag = Logger.Tags.VIDEO_USB,
-                                    )
-                                }
-
-                                // Notify callback that video data was received
-                                callback.onMessage(header.type.id, null, 0)
+                                // Notify callback that video data was received (empty payload signals streaming)
+                                callback.onMessage(header.type.id, ByteArray(0))
                             } catch (e: Exception) {
+                                // Log but don't propagate - prevents reading loop crash on video processing errors
                                 log("Video processing error (non-fatal): ${e.message}")
-                                receiveErrors.incrementAndGet()
+                                receiveErrors++
                             }
                         }
                         continue
                     }
 
-                    // Read payload for non-video messages (audio, commands, media metadata, etc.)
-                    // For AUDIO_DATA: reuse pre-allocated audioBuffer to avoid per-packet allocation
-                    val isAudio = header.type == com.carlink.protocol.MessageType.AUDIO_DATA
-                    var dataLength = 0
-                    val payload: ByteArray? =
+                    // Read payload for non-video messages (or video if no processor)
+                    val payload =
                         if (header.length > 0) {
-                            val payloadBuffer =
-                                if (isAudio) {
-                                    // Grow audioBuffer if needed (doubling strategy)
-                                    if (header.length > audioBuffer.size) {
-                                        audioBuffer = ByteArray(maxOf(header.length, audioBuffer.size * 2))
-                                    }
-                                    audioBuffer
-                                } else {
-                                    ByteArray(header.length)
-                                }
+                            val payloadBuffer = ByteArray(header.length)
                             var totalRead = 0
                             while (totalRead < header.length && _isReadingLoopActive.get()) {
-                                val chunkRead = read(chunkBuffer, timeout)
+                                val remaining = header.length - totalRead
+                                val chunk = ByteArray(minOf(remaining, 16384))
+                                val chunkRead = read(chunk, timeout)
                                 if (chunkRead > 0) {
-                                    val bytesToCopy = minOf(chunkRead, header.length - totalRead)
-                                    System.arraycopy(chunkBuffer, 0, payloadBuffer, totalRead, bytesToCopy)
-                                    totalRead += bytesToCopy
+                                    System.arraycopy(chunk, 0, payloadBuffer, totalRead, chunkRead)
+                                    totalRead += chunkRead
                                 } else if (chunkRead == -1) {
                                     // Timeout
                                     break
                                 }
                             }
-                            if (totalRead == header.length) {
-                                dataLength = totalRead
-                                payloadBuffer
-                            } else {
-                                logWarn(
-                                    "[USB_PARTIAL] Incomplete payload for type=0x${header.type.id.toString(16)}: " +
-                                        "got=$totalRead/${header.length}B — dropped",
-                                    tag = com.carlink.logging.Logger.Tags.PROTO_UNKNOWN,
-                                )
-                                null
-                            }
+                            if (totalRead == header.length) payloadBuffer else null
                         } else {
                             null
                         }
 
-                    // Deliver message to callback
+                    // Deliver message
                     try {
-                        callback.onMessage(header.type.id, payload, dataLength)
+                        callback.onMessage(header.type.id, payload)
                     } catch (e: Exception) {
                         log("Message callback error: ${e.message}")
                     }
@@ -593,21 +482,28 @@ class UsbDeviceWrapper(
             name = "USB-ReadLoop"
             isDaemon = true
             start()
-        }.also { readLoopThread = it }
+        }
     }
 
     /**
      * Stop the reading loop.
      */
     fun stopReadingLoop() {
-        if (!_isReadingLoopActive.getAndSet(false)) return
-        try {
-            readLoopThread?.join(1000)
-        } catch (_: InterruptedException) {
-            Thread.currentThread().interrupt()
-        }
-        readLoopThread = null
+        _isReadingLoopActive.set(false)
     }
+
+    /**
+     * Get performance statistics.
+     */
+    fun getPerformanceStats(): Map<String, Any> =
+        mapOf(
+            "bytesSent" to bytesSent,
+            "bytesReceived" to bytesReceived,
+            "sendCount" to sendCount,
+            "receiveCount" to receiveCount,
+            "sendErrors" to sendErrors,
+            "receiveErrors" to receiveErrors,
+        )
 
     // ==================== Private Methods ====================
 
@@ -670,21 +566,6 @@ class UsbDeviceWrapper(
         ): UsbDeviceWrapper? {
             val device = findDevices(usbManager).firstOrNull() ?: return null
             return UsbDeviceWrapper(context, usbManager, device, logCallback)
-        }
-
-        /**
-         * Extract source PTS from video header buffer.
-         * PTS is at offset 12 in the 20-byte video header, little-endian int.
-         */
-        fun extractPtsFromHeader(
-            buffer: ByteArray,
-            offset: Int = 0,
-        ): Int {
-            if (buffer.size < offset + 16) return 0
-            return (buffer[offset + 12].toInt() and 0xFF) or
-                ((buffer[offset + 13].toInt() and 0xFF) shl 8) or
-                ((buffer[offset + 14].toInt() and 0xFF) shl 16) or
-                ((buffer[offset + 15].toInt() and 0xFF) shl 24)
         }
     }
 }

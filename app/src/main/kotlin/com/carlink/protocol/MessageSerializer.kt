@@ -10,6 +10,8 @@ import java.nio.charset.StandardCharsets
  *
  * Serializes message objects into binary format for transmission to the Carlinkit adapter.
  * Handles header generation, payload encoding, and type-specific serialization.
+ *
+ * Ported from: lib/driver/sendable.dart
  */
 object MessageSerializer {
     /**
@@ -61,6 +63,34 @@ object MessageSerializer {
     // ==================== Touch Messages ====================
 
     /**
+     * Serialize a single touch event.
+     *
+     * @param action Touch action type
+     * @param x Normalized X coordinate (0.0 to 1.0)
+     * @param y Normalized Y coordinate (0.0 to 1.0)
+     */
+    fun serializeTouch(
+        action: TouchAction,
+        x: Float,
+        y: Float,
+    ): ByteArray {
+        val finalX = (10000 * x).toInt().coerceIn(0, 10000)
+        val finalY = (10000 * y).toInt().coerceIn(0, 10000)
+
+        val payload =
+            ByteBuffer
+                .allocate(16)
+                .order(ByteOrder.LITTLE_ENDIAN)
+                .putInt(action.id)
+                .putInt(finalX)
+                .putInt(finalY)
+                .putInt(0) // flags
+                .array()
+
+        return serializeWithPayload(MessageType.TOUCH, payload)
+    }
+
+    /**
      * Touch point data for multi-touch events.
      */
     data class TouchPoint(
@@ -71,8 +101,9 @@ object MessageSerializer {
     )
 
     /**
-     * Serialize a multi-touch event (CarPlay).
-     * Uses 0..1 float coordinates, message type 0x17.
+     * Serialize a multi-touch event.
+     *
+     * @param touches List of touch points with normalized coordinates
      */
     fun serializeMultiTouch(touches: List<TouchPoint>): ByteArray {
         val payload = ByteBuffer.allocate(touches.size * 16).order(ByteOrder.LITTLE_ENDIAN)
@@ -85,44 +116,6 @@ object MessageSerializer {
         }
 
         return serializeWithPayload(MessageType.MULTI_TOUCH, payload.array())
-    }
-
-    /**
-     * Serialize a single-touch event (Android Auto).
-     * Uses 0..10000 integer coordinates, message type 0x05.
-     * AA adapter firmware expects this format — different from CarPlay multitouch.
-     *
-     * Payload (16 bytes LE):
-     *   [0-3]:  action code (14=DOWN, 15=MOVE, 16=UP)
-     *   [4-7]:  x coordinate (0..10000)
-     *   [8-11]: y coordinate (0..10000)
-     *   [12-15]: flags = encoderType | (offScreen << 16)
-     *            encoderType: 1=H264, 2=H265, 4=MJPEG (current video encoder state)
-     *            offScreen: 0=on-screen, 1=off-screen
-     *
-     * @param encoderType Current video encoder type from video header flags (default 2 = H265/initial)
-     * @param offScreen Current off-screen state from video header flags (default 0 = on-screen)
-     */
-    fun serializeSingleTouch(
-        x: Int,
-        y: Int,
-        action: MultiTouchAction,
-        encoderType: Int = 2,
-        offScreen: Int = 0,
-    ): ByteArray {
-        val actionCode =
-            when (action) {
-                MultiTouchAction.DOWN -> 14
-                MultiTouchAction.MOVE -> 15
-                MultiTouchAction.UP -> 16
-                else -> return ByteArray(0)
-            }
-        val payload = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN)
-        payload.putInt(actionCode)
-        payload.putInt(x.coerceIn(0, 10000))
-        payload.putInt(y.coerceIn(0, 10000))
-        payload.putInt(encoderType or (offScreen shl 16))
-        return serializeWithPayload(MessageType.TOUCH, payload.array())
     }
 
     // ==================== Audio Messages ====================
@@ -157,18 +150,14 @@ object MessageSerializer {
     // ==================== GNSS Messages ====================
 
     /**
-     * Serialize GNSS/NMEA data for forwarding to adapter.
+     * Serialize NMEA sentences for GPS forwarding to the adapter.
+     * The adapter relays these to CarPlay via iAP2 LocationInformation.
      *
-     * Payload format (Type 0x29):
-     *   [0x00] nmeaLength (4B LE uint32) - length of NMEA data
-     *   [0x04] nmeaData (N bytes)        - NMEA 0183 ASCII sentences
-     *
-     * The adapter forwards this to the iPhone via iAP2 LocationInformation.
-     *
-     * @param nmeaSentences NMEA 0183 sentences (CR+LF terminated)
+     * @param nmea One or more NMEA sentences (e.g. "$GPGGA,...\r\n$GPRMC,...\r\n")
      */
-    fun serializeGnssData(nmeaSentences: String): ByteArray {
-        val nmeaBytes = nmeaSentences.toByteArray(Charsets.US_ASCII)
+    fun serializeGnss(nmea: String): ByteArray {
+        val nmeaBytes = nmea.toByteArray(Charsets.US_ASCII)
+        require(nmeaBytes.size <= 8 * 1024) { "NMEA string exceeds safe size: ${nmeaBytes.size}" }
         val payload =
             ByteBuffer
                 .allocate(4 + nmeaBytes.size)
@@ -177,44 +166,6 @@ object MessageSerializer {
                 .put(nmeaBytes)
                 .array()
         return serializeWithPayload(MessageType.GNSS_DATA, payload)
-    }
-
-    // ==================== Device Management Messages ====================
-
-    /** Validates a BT MAC address format: "XX:XX:XX:XX:XX:XX" (17 ASCII chars, hex + colons). */
-    private val BT_MAC_REGEX = Regex("^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
-
-    private fun requireValidMac(btMac: String) {
-        require(BT_MAC_REGEX.matches(btMac)) {
-            "Invalid BT MAC address format: \"$btMac\" (expected XX:XX:XX:XX:XX:XX)"
-        }
-    }
-
-    /**
-     * Serialize an AutoConnect_By_BluetoothAddress message (H→A).
-     * Tells the adapter to connect to a specific paired device by MAC address.
-     *
-     * Uses MessageType.WIFI_STATUS_DATA (0x11) — dual-purpose type:
-     * A→H = WiFi status data, H→A = AutoConnect_By_BluetoothAddress.
-     *
-     * @param btMac Bluetooth MAC address (format: "XX:XX:XX:XX:XX:XX")
-     */
-    fun serializeAutoConnectByBtAddress(btMac: String): ByteArray {
-        requireValidMac(btMac)
-        val payload = btMac.toByteArray(StandardCharsets.US_ASCII)
-        return serializeWithPayload(MessageType.WIFI_STATUS_DATA, payload)
-    }
-
-    /**
-     * Serialize a ForgetBluetoothAddr message (H→A).
-     * Tells the adapter to remove a device from its paired list (DevList → DeletedDevList).
-     *
-     * @param btMac Bluetooth MAC address (format: "XX:XX:XX:XX:XX:XX")
-     */
-    fun serializeForgetBluetoothAddr(btMac: String): ByteArray {
-        requireValidMac(btMac)
-        val payload = btMac.toByteArray(StandardCharsets.US_ASCII)
-        return serializeWithPayload(MessageType.FORGET_BLUETOOTH_ADDR, payload)
     }
 
     // ==================== File Messages ====================
@@ -280,18 +231,6 @@ object MessageSerializer {
      */
     fun serializeHeartbeat(): ByteArray = serializeHeaderOnly(MessageType.HEARTBEAT)
 
-    /** Reboot adapter. Type 0xCD outbound = HUDComand_A_Reboot. Header-only. */
-    fun serializeRebootAdapter(): ByteArray = serializeHeaderOnly(MessageType.HEARTBEAT_ECHO)
-
-    /** USB-level reset only (softer than reboot). Type 0xCE outbound = HUDComand_A_ResetUSB. */
-    fun serializeUsbReset(): ByteArray = serializeHeaderOnly(MessageType.ERROR_REPORT)
-
-    /** Disconnect phone's CarPlay/AA session. Type 0x0F outbound. Header-only. */
-    fun serializeDisconnectPhone(): ByteArray = serializeHeaderOnly(MessageType.DISCONNECT_PHONE)
-
-    /** Close dongle — stop adapter internal processes. Type 0x15 outbound. Header-only. */
-    fun serializeCloseDongle(): ByteArray = serializeHeaderOnly(MessageType.CLOSE_DONGLE)
-
     /**
      * Serialize an open message with adapter configuration.
      */
@@ -318,39 +257,17 @@ object MessageSerializer {
     fun serializeBoxSettings(
         config: AdapterConfig,
         syncTime: Long? = null,
-        /** Actual video surface width — use instead of config when available (Compose insets may differ from WindowMetrics). */
-        surfaceWidth: Int = 0,
-        /** Actual video surface height. */
-        surfaceHeight: Int = 0,
     ): ByteArray {
         val actualSyncTime = syncTime ?: (System.currentTimeMillis() / 1000)
 
-        // Android Auto H.264 stream resolution selection.
-        // Google AA only supports 3 fixed H.264 resolutions: 800x480, 1280x720, 1920x1080.
-        // androidAutoSizeW = tier width, androidAutoSizeH = content height within the frame.
-        // The phone renders content in a centered band, with black bars filling the rest.
-        // The host SurfaceView is oversized to the tier AR and clipped to remove the bars.
-        //
-        // Use actual surface dims for AR calculation. On AAOS, WindowMetrics (config) may subtract
-        // dock/nav insets that Compose's WindowInsets.systemBars doesn't, causing a mismatch.
-        // The surface dims are the ground truth for the actual view size.
-        val w = if (surfaceWidth > 0) surfaceWidth else config.width
-        val h = if (surfaceHeight > 0) surfaceHeight else config.height
-        val displayAR = w.toFloat() / h.toFloat()
-
-        val (tierWidth, tierHeight) =
+        // Android Auto Resolution Selection Algorithm
+        // AA supports only 3 resolutions: 800x480, 1280x720, 1920x1080
+        val (aaWidth, aaHeight) =
             when {
-                w >= 1920 -> Pair(1920, 1080)
-                w >= 1280 -> Pair(1280, 720)
+                config.width >= 1920 && config.height >= 1080 -> Pair(1920, 1080)
+                config.width >= 1280 && config.height >= 720 -> Pair(1280, 720)
                 else -> Pair(800, 480)
             }
-        val aaWidth = tierWidth
-        val aaHeight = ((tierWidth.toFloat() / displayAR).toInt() and 0xFFFE).coerceAtMost(tierHeight)
-        com.carlink.logging.logInfo(
-            "[AA_BOXSETTINGS] surface=${w}x$h config=${config.width}x${config.height} " +
-                "displayAR=${"%.3f".format(displayAR)} tier=${tierWidth}x$tierHeight aaSize=${aaWidth}x$aaHeight",
-            tag = "ADAPTR",
-        )
 
         val json =
             JSONObject().apply {
@@ -358,23 +275,14 @@ object MessageSerializer {
                 put("syncTime", actualSyncTime)
                 put("androidAutoSizeW", aaWidth)
                 put("androidAutoSizeH", aaHeight)
-                put("mediaSound", 1) // 48kHz only
+                put("mediaSound", if (config.sampleRate == 44100) 0 else 1) // 0=44.1kHz, 1=48kHz
                 put("callQuality", config.callQuality) // 0=normal, 1=clear, 2=HD
-                put("WiFiChannel", 36) // 5GHz channel 36
-                put("wifiChannel", 36) // Both keys for compatibility
-                // DashboardInfo bitmask: bit 0=MediaPlayer, bit 1=LocationEngine, bit 2=RouteGuidance
-                // 7 = all engines enabled. Adapter forwards all data; app decides what to use.
-                put("DashboardInfo", 7)
-                // GNSSCapability: bitmask for iAP2 GPS — bit 0=GPGGA, bit 1=GPRMC.
-                // Always 3 (both enabled). The pipeline is always open on the adapter side;
-                // GPS forwarding is gated by whether the app sends GNSS_DATA (0x29) messages.
-                put("GNSSCapability", 3)
-                put("wifiName", config.boxName)
-                put("btName", config.boxName)
-                put("boxName", config.boxName)
-                put("OemName", config.boxName)
-                put("autoConn", true) // Auto-connect when device detected
-                put("autoPlay", false) // Don't auto-play media on connection
+                put("WiFiChannel", 161) // 5GHz channel 161 (optimal low interference)
+                put("wifiChannel", 161) // Both keys for compatibility
+                put("wifiName", "carlink")
+                put("btName", "carlink")
+                put("boxName", "carlink")
+                put("OemName", "carlink")
             }
 
         val payload = json.toString().toByteArray(StandardCharsets.US_ASCII)
@@ -383,14 +291,16 @@ object MessageSerializer {
 
     /**
      * Generate AirPlay configuration string.
-     * oemIconLabel is always "Exit" regardless of box settings.
-     * Uses explicit \n (not raw multiline string)
+     * Note: 'name' must be "AutoBox" (hardcoded) for CarPlay UI to display correctly.
+     * The custom display name goes in 'oemIconLabel' only.
      */
     fun generateAirplayConfig(config: AdapterConfig): String =
-        "oemIconVisible = 1\nname = AutoBox\n" +
-            "model = Magic-Car-Link-1.00\n" +
-            "oemIconPath = /etc/oem_icon.png\n" +
-            "oemIconLabel = Exit\n"
+        """oemIconVisible = ${if (config.oemIconVisible) "1" else "0"}
+name = AutoBox
+model = Magic-Car-Link-1.00
+oemIconPath = /etc/oem_icon.png
+oemIconLabel = ${config.boxName}
+"""
 
     // ==================== Initialization Sequence ====================
 
@@ -400,12 +310,10 @@ object MessageSerializer {
      */
     object ConfigKey {
         const val AUDIO_SOURCE = "audio_source"
+        const val SAMPLE_RATE = "sample_rate"
         const val MIC_SOURCE = "mic_source"
         const val WIFI_BAND = "wifi_band"
         const val CALL_QUALITY = "call_quality"
-        const val MEDIA_DELAY = "media_delay"
-        const val HAND_DRIVE = "hand_drive_mode"
-        const val GPS_FORWARDING = "gps_forwarding"
     }
 
     /**
@@ -420,32 +328,14 @@ object MessageSerializer {
         config: AdapterConfig,
         initMode: String,
         pendingChanges: Set<String> = emptySet(),
-        surfaceWidth: Int = 0,
-        surfaceHeight: Int = 0,
     ): List<ByteArray> {
         val messages = mutableListOf<ByteArray>()
 
         // === MINIMAL CONFIG: Always sent (every session) ===
         // - DPI: stored in /tmp/ which is cleared on adapter power cycle
         // - Open: display dimensions may change between sessions
-        // - BoxSettings: androidAutoSizeW/H depends on display AR which changes with display mode
-        // - ViewArea/SafeArea: tied to display mode which may change between sessions
-        // - Android work mode: must be re-sent on each reconnect to restart AA daemon
-        // - Audio source & mic source: adapter resets both to defaults on disconnect
-        //   (confirmed: firmware logs show no persistence). Must re-send every session
-        //   to ensure BT/adapter audio and mic routing match host config.
         messages.add(serializeNumber(config.dpi, FileAddress.DPI))
         messages.add(serializeOpen(config))
-        messages.add(serializeBoxSettings(config, surfaceWidth = surfaceWidth, surfaceHeight = surfaceHeight))
-        config.viewAreaData?.let {
-            messages.add(serializeFile(FileAddress.HU_VIEWAREA_INFO.path, it))
-        }
-        config.safeAreaData?.let {
-            messages.add(serializeFile(FileAddress.HU_SAFEAREA_INFO.path, it))
-        }
-        if (config.androidWorkMode) {
-            messages.add(serializeBoolean(true, FileAddress.ANDROID_WORK_MODE))
-        }
 
         when (initMode) {
             "MINIMAL_ONLY" -> {
@@ -457,7 +347,7 @@ object MessageSerializer {
 
             "MINIMAL_PLUS_CHANGES" -> {
                 // Add only the changed settings
-                addChangedSettings(messages, config, pendingChanges, surfaceWidth, surfaceHeight)
+                addChangedSettings(messages, config, pendingChanges)
                 // WiFi Enable sent last to activate wireless mode after config
                 messages.add(serializeCommand(CommandMapping.WIFI_ENABLE))
                 return messages
@@ -465,7 +355,7 @@ object MessageSerializer {
 
             else -> {
                 // FULL - add all settings
-                addFullSettings(messages, config, surfaceWidth, surfaceHeight)
+                addFullSettings(messages, config)
                 // WiFi Enable sent last to activate wireless mode after config
                 messages.add(serializeCommand(CommandMapping.WIFI_ENABLE))
                 return messages
@@ -480,8 +370,6 @@ object MessageSerializer {
         messages: MutableList<ByteArray>,
         config: AdapterConfig,
         pendingChanges: Set<String>,
-        surfaceWidth: Int = 0,
-        surfaceHeight: Int = 0,
     ) {
         for (key in pendingChanges) {
             when (key) {
@@ -493,6 +381,11 @@ object MessageSerializer {
                             CommandMapping.AUDIO_TRANSFER_OFF
                         }
                     messages.add(serializeCommand(command))
+                }
+
+                ConfigKey.SAMPLE_RATE -> {
+                    // Sample rate is part of BoxSettings, need to send full BoxSettings
+                    messages.add(serializeBoxSettings(config))
                 }
 
                 ConfigKey.MIC_SOURCE -> {
@@ -517,24 +410,7 @@ object MessageSerializer {
 
                 ConfigKey.CALL_QUALITY -> {
                     // Call quality is part of BoxSettings, need to send full BoxSettings
-                    messages.add(serializeBoxSettings(config, surfaceWidth = surfaceWidth, surfaceHeight = surfaceHeight))
-                }
-
-                ConfigKey.MEDIA_DELAY -> {
-                    // Media delay is part of BoxSettings, need to send full BoxSettings
-                    messages.add(serializeBoxSettings(config, surfaceWidth = surfaceWidth, surfaceHeight = surfaceHeight))
-                }
-
-                ConfigKey.HAND_DRIVE -> {
-                    messages.add(serializeNumber(config.handDriveMode, FileAddress.HAND_DRIVE_MODE))
-                }
-
-                ConfigKey.GPS_FORWARDING -> {
-                    // GNSSCapability=3 and DashboardInfo=7 are always sent in BoxSettings.
-                    // GPS forwarding is gated by whether the app sends GNSS_DATA (0x29),
-                    // not by adapter config. No BoxSettings or datastore change needed here.
-                    // Resend BoxSettings anyway to sync any other config that may have changed.
-                    messages.add(serializeBoxSettings(config, surfaceWidth = surfaceWidth, surfaceHeight = surfaceHeight))
+                    messages.add(serializeBoxSettings(config))
                 }
             }
         }
@@ -546,17 +422,12 @@ object MessageSerializer {
     private fun addFullSettings(
         messages: MutableList<ByteArray>,
         config: AdapterConfig,
-        surfaceWidth: Int = 0,
-        surfaceHeight: Int = 0,
     ) {
-        // Hand drive mode: 0 = Left Hand Drive (LHD), 1 = Right Hand Drive (RHD)
-        messages.add(serializeNumber(config.handDriveMode, FileAddress.HAND_DRIVE_MODE))
-
         // Box name
         messages.add(serializeString(config.boxName, FileAddress.BOX_NAME))
 
-        // Charge mode: 0 = off (no quick charge), 1 = quick charge enabled
-        messages.add(serializeNumber(0, FileAddress.CHARGE_MODE))
+        // AirPlay configuration
+        messages.add(serializeString(generateAirplayConfig(config), FileAddress.AIRPLAY_CONFIG))
 
         // Upload icons if provided
         config.icon120Data?.let { messages.add(serializeFile(FileAddress.ICON_120.path, it)) }
@@ -567,31 +438,19 @@ object MessageSerializer {
         val wifiCommand = if (config.wifiType == "5ghz") CommandMapping.WIFI_5G else CommandMapping.WIFI_24G
         messages.add(serializeCommand(wifiCommand))
 
-        // Box settings JSON — includes DashboardInfo=7 and GNSSCapability=3 always.
-        // These are persisted to riddle.conf by the firmware's ConfigFileUtils.
-        // No datastore invalidation needed — values are constant and never change.
-        messages.add(serializeBoxSettings(config, surfaceWidth = surfaceWidth, surfaceHeight = surfaceHeight))
-
-        // AirPlay configuration AFTER BoxSettings — firmware rewrites airplay.conf
-        // during BoxSettings processing, so this must come last to persist oemIconLabel
-        messages.add(serializeString(generateAirplayConfig(config), FileAddress.AIRPLAY_CONFIG))
+        // Box settings JSON (includes sample rate, call quality)
+        messages.add(serializeBoxSettings(config))
 
         // Microphone source
         val micCommand = if (config.micType == "box") CommandMapping.BOX_MIC else CommandMapping.MIC
         messages.add(serializeCommand(micCommand))
 
         // Audio transfer mode
-        val audioTransferCommand =
-            if (config.audioTransferMode) {
-                CommandMapping.AUDIO_TRANSFER_ON
-            } else {
-                CommandMapping.AUDIO_TRANSFER_OFF
-            }
+        val audioTransferCommand = if (config.audioTransferMode) CommandMapping.AUDIO_TRANSFER_ON else CommandMapping.AUDIO_TRANSFER_OFF
         messages.add(serializeCommand(audioTransferCommand))
 
-        // Android work mode (if enabled)
-        if (config.androidWorkMode) {
-            messages.add(serializeBoolean(true, FileAddress.ANDROID_WORK_MODE))
-        }
+        // ALWAYS enable AndroidWorkMode
+        messages.add(serializeBoolean(true, FileAddress.ANDROID_WORK_MODE))
     }
+
 }

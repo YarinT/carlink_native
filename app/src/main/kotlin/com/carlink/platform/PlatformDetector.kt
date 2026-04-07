@@ -103,7 +103,7 @@ object PlatformDetector {
         val hardware = Build.HARDWARE ?: ""
 
         val isGmAaos = detectGmAaos(manufacturer, product, device)
-        val (_, hardwareH264DecoderName) = detectHardwareH264Decoder()
+        val (hasHardwareCodec, hardwareH264DecoderName) = detectHardwareH264Decoder()
         val hasIntelCodec = hardwareH264DecoderName?.contains("Intel", ignoreCase = true) == true
         val nativeSampleRate = detectNativeSampleRate(context)
 

@@ -1,5 +1,6 @@
 plugins {
     id("com.android.application")
+    id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
@@ -7,20 +8,12 @@ android {
     namespace = "com.carlink"
     compileSdk = 36
 
-//###############################################
-//###############################################
-//###############################################
-
     defaultConfig {
-        applicationId = "zeno.carlink"
+        applicationId = "com.werksmangm.cpaaplayer"
         minSdk = 32
         targetSdk = 36
-        versionCode = 105
-        versionName = "1.0.0"
-
-//###############################################
-//###############################################
-//###############################################
+        versionCode = 61
+        versionName = "1.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -31,7 +24,7 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = true
+            isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -42,6 +35,10 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
     }
 
     buildFeatures {
@@ -61,8 +58,6 @@ android {
         // with microphone timing - Timer.scheduleAtFixedRate works reliably.
         // See documents/revisions.txt [19], [21] for history.
         disable += "DiscouragedApi"
-        disable += "Instantiatable"  // CarAppActivity from app-automotive AAR — false positive
-        disable += "InvalidUsesTagAttribute"  // "navigation" is valid for Car App Library nav apps
     }
 }
 
@@ -71,20 +66,17 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
 
     // AndroidX Core
-    implementation("androidx.core:core-ktx:1.18.0")
+    implementation("androidx.core:core-ktx:1.17.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.10.0")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.10.0")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.10.0")
-    implementation("androidx.activity:activity-compose:1.13.0")
+    implementation("androidx.activity:activity-compose:1.12.2")
 
     // DataStore for preferences persistence
-    implementation("androidx.datastore:datastore-preferences:1.2.1")
-
-    // DocumentFile for SAF file operations (capture recording)
-    implementation("androidx.documentfile:documentfile:1.1.0")
+    implementation("androidx.datastore:datastore-preferences:1.2.0")
 
     // Compose BOM
-    implementation(platform("androidx.compose:compose-bom:2026.03.00"))
+    implementation(platform("androidx.compose:compose-bom:2025.12.01"))
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.ui:ui-tooling-preview")
@@ -94,15 +86,15 @@ dependencies {
     // MediaSession for AAOS integration (uses MediaSessionCompat)
     implementation("androidx.media:media:1.7.1")
 
-    // Car App Library for AAOS cluster navigation (Templates Host)
-    implementation("androidx.car.app:app:1.7.0")
-    implementation("androidx.car.app:app-automotive:1.7.0")
+    // Car App Library for AAOS instrument cluster integration
+    // Provides CarAppService, Session, NavigationManager, Maneuver, Distance, etc.
+    implementation("androidx.car.app:app-automotive:1.4.0")
 
     // Testing
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.3.0")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.7.0")
-    androidTestImplementation(platform("androidx.compose:compose-bom:2026.03.00"))
+    androidTestImplementation(platform("androidx.compose:compose-bom:2025.12.01"))
     androidTestImplementation("androidx.compose.ui:ui-test-junit4")
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")

@@ -14,6 +14,7 @@ import com.carlink.logging.Logger
 import java.io.ByteArrayOutputStream
 import java.util.Collections
 import java.util.LinkedHashMap
+import java.util.concurrent.Executors
 
 /**
  * Shim ContentProvider that claims the orphaned authority
@@ -36,6 +37,8 @@ class ClusterIconShimProvider : ContentProvider() {
             "com.google.android.apps.automotive.templates.host.ClusterIconContentProvider"
         private const val MAX_CACHE_SIZE = 20
     }
+
+    private val pipeExecutor = Executors.newFixedThreadPool(2)
 
     private val iconCache: MutableMap<String, ByteArray> =
         Collections.synchronizedMap(
@@ -70,6 +73,16 @@ class ClusterIconShimProvider : ContentProvider() {
         if (iconId == null || data == null) {
             Logger.w("insert() missing iconId or data (iconId=$iconId, dataSize=${data?.size})", tag = TAG)
             // Return a non-null URI to prevent skipIcons = true
+            return "content://$AUTHORITY/img/unknown".toUri()
+        }
+
+        // Validate PNG magic (89 50 4E 47) to prevent arbitrary binary injection into the
+        // cache, which would later crash scaleIcon()'s BitmapFactory decode with a non-image payload.
+        if (data.size < 4 ||
+            data[0] != 0x89.toByte() || data[1] != 0x50.toByte() ||
+            data[2] != 0x4E.toByte() || data[3] != 0x47.toByte()
+        ) {
+            Logger.w("insert() rejected non-PNG data for $iconId (size=${data.size})", tag = TAG)
             return "content://$AUTHORITY/img/unknown".toUri()
         }
 
@@ -153,7 +166,7 @@ class ClusterIconShimProvider : ContentProvider() {
         val readEnd = pipe[0]
         val writeEnd = pipe[1]
 
-        Thread({
+        pipeExecutor.execute {
             try {
                 ParcelFileDescriptor.AutoCloseOutputStream(writeEnd).use { os ->
                     os.write(outputData)
@@ -161,7 +174,7 @@ class ClusterIconShimProvider : ContentProvider() {
             } catch (e: Exception) {
                 Logger.e("openFile() pipe write error for $cacheKey: ${e.message}", tag = TAG)
             }
-        }, "IconShim-Pipe").start()
+        }
 
         return readEnd
     }

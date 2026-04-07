@@ -77,7 +77,7 @@ object NavigationStateManager {
         "com.google.android.apps.automotive.templates.host.ClusterIconContentProvider"
 
     /** Timestamp (elapsedRealtime) of the last maneuver-bearing message. */
-    private var lastManeuverMs = 0L
+    @Volatile private var lastManeuverMs = 0L
 
     /**
      * Latest AA maneuver icon received via MEDIA_DATA sub-type 201.
@@ -89,6 +89,7 @@ object NavigationStateManager {
         private set
 
     /** Content hash of the current icon to avoid redundant BitmapFactory decodes. */
+    @Volatile
     private var currentIconHash = 0
 
     /** Null until checked; then true when the cluster icon provider can be resolved by this app. */
@@ -144,8 +145,8 @@ object NavigationStateManager {
         }
     }
 
-    /** True unless we have explicitly confirmed the provider is unavailable. */
-    fun canUseAaManeuverIcon(): Boolean = isClusterIconProviderAvailable != false
+    /** True only after initialization confirms the provider is available. */
+    fun canUseAaManeuverIcon(): Boolean = isClusterIconProviderAvailable == true
 
     private fun dropCurrentManeuverIcon() {
         val hadIcon = currentManeuverIcon != null || currentIconHash != 0

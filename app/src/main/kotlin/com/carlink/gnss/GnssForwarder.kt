@@ -50,18 +50,23 @@ class GnssForwarder(
         val listener =
             object : LocationListener {
                 override fun onLocationChanged(location: Location) {
-                    val nmea = formatNmea(location)
-                    val sent = sendGnssData(nmea)
-                    val acc = if (location.hasAccuracy()) "%.1fm".format(Locale.US, location.accuracy) else "n/a"
-                    log(
-                        "[GNSS] lat=%.5f lon=%.5f alt=%.0f spd=%.1f acc=$acc sent=$sent".format(
-                            Locale.US,
-                            location.latitude,
-                            location.longitude,
-                            location.altitude,
-                            location.speed,
-                        ),
-                    )
+                    try {
+                        val nmea = formatNmea(location)
+                        val sent = sendGnssData(nmea)
+                        val acc = if (location.hasAccuracy()) "%.1fm".format(Locale.US, location.accuracy) else "n/a"
+                        log(
+                            "[GNSS] lat=%.5f lon=%.5f alt=%.0f spd=%.1f acc=$acc sent=$sent".format(
+                                Locale.US,
+                                location.latitude,
+                                location.longitude,
+                                location.altitude,
+                                location.speed,
+                            ),
+                        )
+                    } catch (e: SecurityException) {
+                        log("[GNSS] Location permission revoked at runtime — stopping forwarder")
+                        stop()
+                    }
                 }
 
                 override fun onProviderEnabled(provider: String) {}

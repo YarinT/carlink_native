@@ -1,112 +1,104 @@
-# Carlink
+# Carlink Native
 
-Carlink is a **native** Kotlin code implementation from the original [Flutter-based](https://github.com/lvalen91/Carlink) app.
-I did this app for me and my use, but sharing so others can use it. Don't expect or demand support but I'll help where i can.
+**A native Android implementation of a Carlink alternative, without Flutter/Dart dependencies.**
 
-### Requirments
+[![Kotlin](https://img.shields.io/badge/Kotlin-81.2%25-blue?logo=kotlin)](https://kotlinlang.org/)
+[![Java](https://img.shields.io/badge/Java-18.8%25-orange?logo=java)](https://www.java.com/)
+[![Android](https://img.shields.io/badge/Platform-Android-green?logo=android)](https://developer.android.com/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-- For AAOS 12 and higher
-- For (Carlinkit CPC200-CCPA)[https://www.carlinkit.com/ccpa] on firmware 2025.10
+This project is a **lightly updated fork** of the excellent native Android port created by [@lvalen91](https://github.com/lvalen91).  
+The majority of the core architecture, protocol implementation, video/audio handling, and USB communication was developed by him in:
 
+- https://github.com/lvalen91/Carlink (Flutter-based rewrite with native branch)
+- https://github.com/lvalen91/Carlink_native (pure native Kotlin/Java version)
 
-## [XDA Developer Forums](https://xdaforums.com/t/carlink.4774308/)
+**Huge thanks to lvalen91** — this fork would not exist without his extensive reverse-engineering and clean native implementation.
 
+This fork adds quality-of-life improvements, increased reliability on GM AAOS head units, and preparation for potential Google Play publishing.
 
-## Work In progress - Something is always changing.. Not always good
+**Work in Progress** – Builds are versioned in commit messages (e.g., Build 52).
 
+## Improvements in This Fork
+- **Video Reliability**:
+  - Enhanced resume logic with additional/delayed keyframe requests to greatly reduce black screens when returning from background or Settings.
+  - Exposed "Reset Video Stream" for instant decoder recovery (no full USB reconnect needed).
+  - Improved lifecycle handling for surface invalidation and decoder stalls.
+- **Google Play Readiness**:
+  - Harmonized package name, versioning, and build configuration.
+  - Clean native-only codebase.
+  - Optimized for AAOS 12L/14 (GM Intel-based systems) with hardware-accelerated H.264.
+- **Core Features (Thanks to lvalen91's Foundation)**:
+  - Full USB protocol for Carlinkit CPC200-CCPA adapters.
+  - Hardware-accelerated video (MediaCodec) and multi-stream audio.
+  - Multitouch support.
+  - Microphone capture for Siri/voice commands and calls.
+  - MediaSession integration.
+  - Periodic keyframe requests for stable CarPlay sessions.
+  - Auto-reconnect with exponential backoff.
+  - Detailed logging and performance stats.
 
-> [!IMPORTANT]
->My 2024 Silverado gminfo3.7 Intel AAOS radio is the target Platform and my only hardware for testing. 
+Enables **Apple CarPlay** and **Android Auto** projection, with Android Auto forced on every connection.
 
-> [!WARNING]
-> *Compatability on anything else is not verified* and should be treated as **untested**. Optimized for Video and Audio performance on the gminfo3.7. That is **my only focus** you can fork this repo and optimize it for your own needs.
+## Requirements
+- Android Studio (latest, JDK 21+ recommended).
+- Android SDK: minSdk 32 (Android 12L), targetSdk 34 (Android 14).
+- Compatible hardware: Carlinkit CPC200-CCPA adapter + GM AAOS head unit (extensively tested on Intel-based systems).
 
-> [!TIP]
-Remember kids: (mostly me)
->
->Projection streams are live UI state, not video playback.
-Do not buffer, pace, preserve, or “play” frames.
-Late frames must be dropped. Corruption must trigger reset.
->
->CarPlay / Android Auto h264 is not media.
-It is a real-time projection of UI state.
-Correctness is defined by latency, not completeness.
-Buffers create corruption. Queues create lies.
->
->Video is a best-effort, disposable representation of UI state.
-Audio is a continuous time signal that must never stall.
-Video may drop. Audio may buffer. Neither may block the other
+## Important Notes for GM Vehicles
+- **Driving restrictions**: A plain sideloaded APK will not run while the vehicle is in motion. To enable full functionality while driving:
+  1. Create a Google Play Developer Console account ($25 one-time fee).
+  2. Upload the AAB/APK to the **Internal Testing** track.
+  3. Add your Google account to the tester list.
+  4. Install/update via the Play Store on the head unit.
 
-```
-Video:
-- Represents live UI state
-- Late == invalid
-- Drop aggressively
-- Reset on corruption
-- Never wait
+## Installation & Build
 
-Audio:
-- Represents continuous time
-- Late == fill
-- Buffer aggressively
-- Never stall
-- Never block video
-```
+1. **Clone the Repo**:
+   git clone https://github.com/MotoInsight/Carlink_native.git
+   cd Carlink_native
 
+2. **Customize for Publishing** (Google Play Internal Testing):
+   - Open `app/build.gradle.kts`.
+   - Update `defaultConfig`:
+     applicationId = "com.yourcompany.carlinknative"  // Unique package
+     versionCode = 52
+     versionName = "1.0.52"
+   - Sign the release build with your keystore.
 
-> [!IMPORTANT]
-> My Primary smartphone is an iPHone and therefor Carplay as gotten the most tuning and testing. A Google Pixel 10 is used for testing basic functionality, cannot do real-world 'Day to Day' testing.
+3. **Build**:
+   - Open in Android Studio → Sync Gradle.
+   - Build → Build Bundle(s) / APK(s) → `bundleRelease` or `assembleRelease`.
 
-## Screen Shots from Android Emulator with USB-PassThrough for CPC200-CCPA Use
+4. **Deploy**:
+   - Upload AAB to Google Play Internal Testing.
+   - Install via Play Store on the head unit.
 
-![Screenshot of Android Auto via Adapter from Pixel 10](/screenshots/Aauto.png)
-![Screenshot of Apple Carplay via Adapter from iPhone Air](/screenshots/Carplay.png)
+## Usage
+- Plug in adapter → auto-connect.
+- Settings: Immersive mode, audio routing, mic source, WiFi band.
+- **Reset Video Stream**: Instant video recovery from black screen.
+- **Reset Device** (red button): Full USB session restart.
 
-## Main App UI/Page
-![Screenshot of Main App Screen](/screenshots/MainPage.png)
+## Contributing
+- Fork and open PRs for fixes or enhancements.
+- Focus areas: AAOS stability, video reliability, Play Store compliance.
+- Include logs when reporting issues.
 
-## Adapter Configuaration Options
+## Changelog (Recent Builds)
+- **Build 52** (January 4, 2026): Additional keyframe requests on resume; significant black screen reduction.
+- See commit history for earlier changes.
 
-These options can be set for user preferance, but will require an adapter reboot upon tapping 'Apply & Restart'
+## Community & Support
+- OLD discussion thread: [XDA Developers - General Motors Google Built-in Tinkering](https://xdaforums.com/t/general-motors-google-built-in-tinkering.4668105/)
+- NEW Main discussion thread: [XDA Developers - Carlink](https://xdaforums.com/t/carlink.4774308/)
+- Reddit community: [r/SilveradoEV](https://www.reddit.com/r/SilveradoEV/)
+- Check out [OpenSourceEV.com](https://OpenSourceEV.com) for upcoming closed beta access to this project, Silverado EV 3D-printed projects, and open-source STL files.
 
-![](/screenshots/adapter_config-Audio.png)
-![](/screenshots/adapter_confid-Visual.png)
-![](/screenshots/adapter_config-Misc.png)
+## License
+MIT License – Free to use, modify, and distribute.
 
-## App specific Setting
-
-Controls what is hidden or shown to allow more space for the Carlink app to configure and render the Projection UI Stream.
-
-![](/screenshots/Settings-DisplayMode.png)
-
-### App Logging to File Export
-
-If enabled allows exporting app logs to a file. Uses the createDocument function so the native android documents app (files) must be installed. THis bypasses the need for the app and third-party file browsers needing permission to access various folders. You can save directly to an attached USB. 
-
-> [!CAUTION]
->OS restrictions will apply.
-
-![](/screenshots/File_Logging.png)
-
-### Log Levels
-
-Due to how verbose and active this app can be. Espically regarding troubleshooting (the more the information the easier to diagnose). Various log levels are available to help narrow down and focus on the needed areas.
-
-![](/screenshots/LogLevels.png)
-
-# Documentation
-
-I, or mostly CLAUDE, have tried to collect and organize as much documentation as I can in regards to every aspect of this app, adapter, gminfo etc. To not only help me better understand, but others as well. If updates come across without code changes. It's likely new documentation or corrections.
-
-> [!IMPORTANT]
-> I cannot speak for all information to be accurate and free of errors, but its the most detailed and centralized source of information you will likely find anywhere else. Unless you have direct access to the source code of the Adapter itself, GM Radios etc... If you do, i know a guy and a site who will glady take it and publish it anonymously. 
-
-Most of your questions are likly answered in [Carlink Documents](/documents/reference/), but reach out on the XDA Forum. Issues use github to report it or the forum as well.
-
-# Other Repos that started this gravy train, provided insights/inspiration. And Helped a lot.
-# Check them out
-
-- [Carplay by Abuharsky](https://github.com/abuharsky/carplay) - Original Android implementation
-- [Node-Carplay by Rhysmorgan134](https://github.com/rhysmorgan134/node-CarPlay) - Protocol reverse engineering
-- [LIVI by f-io](https://github.com/f-io/LIVI) - Linux (Raspberry Pi) and macOS implementation
-- [PyCarplay by Electric-Monk](https://github.com/electric-monk/pycarplay) - Python implementation
+## Credits & Acknowledgments
+- **Primary development & native port**: [@lvalen91](https://github.com/lvalen91) – massive thanks for the foundation!
+- This fork: Minor QoL improvements and GM-specific tuning by MotoInsight / OpenSourceEV.
+- Community: XDA thread contributors, OpenSourceEV team, and testers across GM vehicle forums.

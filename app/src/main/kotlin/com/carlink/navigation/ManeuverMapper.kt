@@ -24,8 +24,13 @@ import com.carlink.logging.logWarn
  * NaviTurnSide controls U-turn direction (LEFT vs RIGHT) and roundabout rotation (CW vs CCW).
  */
 object ManeuverMapper {
-    /** Cache built Maneuver objects to avoid icon thrashing. */
-    private val maneuverCache = HashMap<Int, Maneuver>()
+    // LRU cache — cpType (6 bits) × turnSide (1 bit) × aaIcon presence (1 bit) ≈ 64 combos max.
+    // Bounded to prevent unbounded growth over a long navigation session.
+    private val maneuverCache: MutableMap<Int, Maneuver> =
+        object : LinkedHashMap<Int, Maneuver>(16, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Int, Maneuver>?): Boolean =
+                size > 64
+        }
 
     /** Identity hash of the AA icon Bitmap used in the last cached entry. */
     private var lastCachedAaIconHash = 0

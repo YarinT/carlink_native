@@ -3,17 +3,18 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <!-- Permissions -->
+    <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
-    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
-    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
-    <!-- Required by connectedDevice foreground service type on Android 14+ -->
-    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
-    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <uses-permission android:name="androidx.car.app.NAVIGATION_TEMPLATES" />
+
+    <!-- AAOS Permissions (optional) -->
+    <uses-permission android:name="android.car.permission.CAR_DRIVING_STATE"
+        tools:ignore="ProtectedPermissions" />
+    <uses-permission android:name="android.car.permission.CAR_UX_RESTRICTIONS_CONFIGURATION"
+        tools:ignore="ProtectedPermissions" />
 
     <!-- USB Host Feature (required) -->
     <uses-feature
@@ -22,16 +23,20 @@
 
     <!-- Optional Features -->
     <uses-feature
+        android:name="android.hardware.usb.accessory"
+        android:required="false" />
+    <uses-feature
         android:name="android.hardware.microphone"
         android:required="false" />
     <uses-feature
         android:name="android.hardware.type.automotive"
         android:required="false" />
     <uses-feature
-        android:name="android.hardware.location.gps"
+        android:name="android.software.car.templates_host"
         android:required="false" />
 
     <application
+        android:appCategory="audio"
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
@@ -82,21 +87,10 @@
             <meta-data
                 android:name="distractionOptimized"
                 android:value="true" />
-        </activity>
-
-        <!-- Hidden CarAppActivity — exists solely to trigger Templates Host binding.
-             NOT a launcher. Lives in separate task. Excluded from recents.
-             MainActivity remains the primary UI. -->
-        <activity
-            android:name="androidx.car.app.activity.CarAppActivity"
-            android:exported="false"
-            android:launchMode="singleTask"
-            android:taskAffinity="zeno.carlink.templates"
-            android:excludeFromRecents="true"
-            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            
             <meta-data
-                android:name="distractionOptimized"
-                android:value="true" />
+                android:name="com.android.automotive"
+                android:resource="@xml/automotive_app_desc" />  
         </activity>
 
         <!-- MediaBrowserService for AAOS Integration -->
@@ -108,50 +102,22 @@
             <intent-filter>
                 <action android:name="android.media.browse.MediaBrowserService" />
             </intent-filter>
-            <!-- GM Homescreen: Hide from launcher while keeping service functional -->
-            <meta-data
-                android:name="com.gm.homescreen.visibility"
-                android:value="HIDDEN" />
         </service>
 
-        <!-- Cluster Navigation CarAppService (headless — no UI on main display) -->
-        <service
-            android:name=".cluster.CarlinkClusterService"
-            android:enabled="false"
+        <!-- ClusterIconShimProvider: claims the orphaned Templates Host authority so
+             maneuver icons are delivered to the instrument cluster. Without this
+             declaration the system never registers the authority and Templates Host
+             permanently sets skipIcons=true on the first failed insert(). -->
+        <provider
+            android:name=".provider.ClusterIconShimProvider"
+            android:authorities="com.google.android.apps.automotive.templates.host.ClusterIconContentProvider"
             android:exported="true"
-            tools:ignore="ExportedService">
-            <intent-filter>
-                <action android:name="androidx.car.app.CarAppService" />
-                <category android:name="androidx.car.app.category.NAVIGATION" />
-                <category android:name="androidx.car.app.category.FEATURE_CLUSTER" />
-            </intent-filter>
-            <meta-data android:name="androidx.car.app.minCarApiLevel" android:value="6" />
-            <meta-data android:name="com.gm.homescreen.visibility" android:value="HIDDEN" />
-        </service>
-
-        <meta-data
-            android:name="com.android.automotive"
-            android:resource="@xml/automotive_app_desc" />
-
-        <!-- Required at application level — Templates Host reads minCarApiLevel
-             from application metadata, not from service element -->
-        <meta-data
-            android:name="androidx.car.app.minCarApiLevel"
-            android:value="6" />
+            android:grantUriPermissions="true" />
 
         <!-- APPLICATION-LEVEL DISTRACTION OPTIMIZATION DECLARATION -->
         <meta-data
             android:name="com.android.automotive.application.DISTRACTION_OPTIMIZED"
             android:value="true" />
-
-        <!-- Shim for Templates Host's unregistered ClusterIconContentProvider.
-             Claims the orphaned authority so icon delivery works for cluster display. -->
-        <provider
-            android:name=".provider.ClusterIconShimProvider"
-            android:authorities="com.google.android.apps.automotive.templates.host.ClusterIconContentProvider"
-            android:exported="true"
-            android:grantUriPermissions="true"
-            tools:ignore="ExportedContentProvider" />
 
     </application>
 

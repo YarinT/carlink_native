@@ -40,10 +40,11 @@ object TripBuilder {
         tripBuilder.addStep(stepBuilder.build(), stepEstimate)
 
         // Next step — from firmware double-maneuver burst
-        if (state.hasNextStep) {
+        val nextManeuverType = if (state.hasNextStep) state.nextManeuverType else null
+        if (nextManeuverType != null) {
             val nextManeuver =
                 ManeuverMapper.buildManeuverForType(
-                    state.nextManeuverType!!,
+                    nextManeuverType,
                     state.turnSide,
                     context,
                 )

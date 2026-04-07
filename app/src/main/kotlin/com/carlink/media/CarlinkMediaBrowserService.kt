@@ -58,65 +58,13 @@ class CarlinkMediaBrowserService : MediaBrowserServiceCompat() {
         private const val NOTIFICATION_ID = 1001
 
         // Singleton holder for MediaSession token
-        // Set via updateSessionToken() to push to a running service instance
+        // Set by CarlinkPlugin when MediaSessionManager initializes
         @Volatile
         var mediaSessionToken: MediaSessionCompat.Token? = null
-
-        // Current now-playing metadata for notification content
-        @Volatile
-        private var currentTitle: String? = null
-
-        @Volatile
-        private var currentArtist: String? = null
 
         // Singleton instance for foreground service control
         @Volatile
         private var instance: CarlinkMediaBrowserService? = null
-
-        /**
-         * Push session token to a running service instance.
-         * Resolves race condition where the system starts the service before
-         * MediaSessionManager is initialized — without this, the service may
-         * report a null token that AAOS caches permanently.
-         */
-        fun updateSessionToken(token: MediaSessionCompat.Token) {
-            mediaSessionToken = token
-            instance?.let { service ->
-                // Guard: MediaBrowserServiceCompat.setSessionToken() throws
-                // IllegalStateException if called twice on the same service instance.
-                // This happens during in-place display mode reinit where CarlinkManager
-                // is recreated but the Service singleton persists.
-                try {
-                    service.setSessionToken(token)
-                    if (BuildConfig.DEBUG) Log.d(TAG, "[BROWSER_SERVICE] Session token pushed to running service")
-                } catch (e: IllegalStateException) {
-                    if (BuildConfig.DEBUG) Log.w(TAG, "[BROWSER_SERVICE] Session token already set (reinit), ignoring: ${e.message}")
-                }
-            }
-        }
-
-        /**
-         * Update notification with current now-playing metadata.
-         * Called from CarlinkManager when media metadata changes.
-         */
-        fun updateNowPlaying(
-            title: String?,
-            artist: String?,
-        ) {
-            if (title == currentTitle && artist == currentArtist) return
-            currentTitle = title
-            currentArtist = artist
-            instance?.refreshNotification()
-        }
-
-        /**
-         * Clear now-playing metadata (e.g., on adapter disconnect).
-         */
-        fun clearNowPlaying() {
-            currentTitle = null
-            currentArtist = null
-            instance?.refreshNotification()
-        }
 
         /**
          * Start foreground service mode when adapter connects.
@@ -147,10 +95,16 @@ class CarlinkMediaBrowserService : MediaBrowserServiceCompat() {
         createNotificationChannel()
         if (BuildConfig.DEBUG) Log.d(TAG, "[BROWSER_SERVICE] onCreate")
 
-        // Set the session token so AAOS can control playback
+        // Set the session token so AAOS can control playback.
+        // Guard: updateSessionToken() can race with onCreate() from the USB thread —
+        // if it calls setSessionToken() first, this call throws uncaught IllegalStateException.
         mediaSessionToken?.let { token ->
-            setSessionToken(token)
-            if (BuildConfig.DEBUG) Log.d(TAG, "[BROWSER_SERVICE] Session token set")
+            try {
+                setSessionToken(token)
+                if (BuildConfig.DEBUG) Log.d(TAG, "[BROWSER_SERVICE] Session token set")
+            } catch (e: IllegalStateException) {
+                if (BuildConfig.DEBUG) Log.w(TAG, "[BROWSER_SERVICE] Session token already set (race in onCreate), ignoring: ${e.message}")
+            }
         } ?: run {
             if (BuildConfig.DEBUG) Log.w(TAG, "[BROWSER_SERVICE] No session token available yet")
         }
@@ -169,7 +123,7 @@ class CarlinkMediaBrowserService : MediaBrowserServiceCompat() {
         clientPackageName: String,
         clientUid: Int,
         rootHints: Bundle?,
-    ): BrowserRoot {
+    ): BrowserRoot? {
         if (BuildConfig.DEBUG) Log.d(TAG, "[BROWSER_SERVICE] onGetRoot from: $clientPackageName (uid=$clientUid)")
 
         // Log AAOS root hints for debugging
@@ -187,26 +141,14 @@ class CarlinkMediaBrowserService : MediaBrowserServiceCompat() {
         // Update session token if available (may have been set after onCreate)
         if (sessionToken == null) {
             mediaSessionToken?.let { token ->
-                try {
-                    setSessionToken(token)
-                    if (BuildConfig.DEBUG) Log.d(TAG, "[BROWSER_SERVICE] Session token set in onGetRoot")
-                } catch (e: IllegalStateException) {
-                    if (BuildConfig.DEBUG) Log.w(TAG, "[BROWSER_SERVICE] Session token already set in onGetRoot (reinit), ignoring: ${e.message}")
-                }
+                setSessionToken(token)
+                if (BuildConfig.DEBUG) Log.d(TAG, "[BROWSER_SERVICE] Session token set in onGetRoot")
             }
         }
 
-        // Return root with content style extras so AAOS recognises this as a
-        // well-formed media source. The browse tree is empty (projection app with
-        // no local library), but the hints prevent miscategorisation on some
-        // AAOS media center implementations.
-        val rootExtras =
-            Bundle().apply {
-                putInt("android.media.browse.CONTENT_STYLE_BROWSABLE_HINT", 1)
-                putInt("android.media.browse.CONTENT_STYLE_PLAYABLE_HINT", 1)
-                putBoolean("android.media.browse.SEARCH_SUPPORTED", false)
-            }
-        return BrowserRoot(EMPTY_ROOT_ID, rootExtras)
+        // Return empty root - allows connection but indicates no browsable content
+        // This is appropriate for projection apps like CarPlay/AA adapters
+        return BrowserRoot(EMPTY_ROOT_ID, null)
     }
 
     /**
@@ -288,8 +230,8 @@ class CarlinkMediaBrowserService : MediaBrowserServiceCompat() {
         val builder =
             NotificationCompat
                 .Builder(this, NOTIFICATION_CHANNEL_ID)
-                .setContentTitle(currentTitle ?: "Carlink")
-                .setContentText(currentArtist ?: "Adapter connected")
+                .setContentTitle("Carlink")
+                .setContentText("Adapter connected")
                 .setSmallIcon(R.mipmap.ic_launcher)
                 .setOngoing(true)
                 .setSilent(true)
@@ -341,22 +283,6 @@ class CarlinkMediaBrowserService : MediaBrowserServiceCompat() {
             if (BuildConfig.DEBUG) Log.d(TAG, "[BROWSER_SERVICE] Exited foreground mode")
         } catch (e: Exception) {
             Log.e(TAG, "[BROWSER_SERVICE] Failed to stop foreground: ${e.message}")
-        }
-    }
-
-    /**
-     * Refresh the foreground notification with current now-playing metadata.
-     * Called when metadata changes or is cleared.
-     */
-    private fun refreshNotification() {
-        if (!isForeground) return
-
-        try {
-            val notification = buildNotification()
-            val notificationManager = getSystemService(NotificationManager::class.java)
-            notificationManager.notify(NOTIFICATION_ID, notification)
-        } catch (e: Exception) {
-            Log.e(TAG, "[BROWSER_SERVICE] Failed to refresh notification: ${e.message}")
         }
     }
 }

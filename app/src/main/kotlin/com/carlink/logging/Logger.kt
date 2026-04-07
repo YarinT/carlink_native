@@ -4,10 +4,20 @@ import android.util.Log
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 
-/** Centralized logging with tag-based filtering and multiple output destinations. */
+/**
+ * Centralized Logging System for Carlink Native
+ *
+ * Provides tag-based filtering, multiple output destinations, and
+ * thread-safe logging operations.
+ *
+ * Ported from: lib/log.dart
+ */
 object Logger {
     private const val TAG = "CARLINK"
 
+    /**
+     * Log levels matching Android Log levels.
+     */
     enum class Level(
         val priority: Int,
     ) {
@@ -18,7 +28,9 @@ object Logger {
         ERROR(Log.ERROR),
     }
 
-    /** LogPreset-compatible log levels. */
+    /**
+     * Log level enum matching Flutter for LogPreset compatibility
+     */
     enum class LogLevel {
         DEBUG,
         INFO,
@@ -26,6 +38,9 @@ object Logger {
         ERROR,
     }
 
+    /**
+     * Known log tags for filtering.
+     */
     object Tags {
         const val USB = "USB"
         const val VIDEO = "VIDEO"
@@ -45,26 +60,33 @@ object Logger {
         const val USB_RAW = "USB_RAW"
         const val AUDIO_DEBUG = "AUDIO_DEBUG"
         const val ERROR_RECOVERY = "ERROR_RECOVERY"
+
+        // Navigation / Cluster / Provider Tags
         const val NAVI = "NAVI"
         const val CLUSTER = "CLUSTER"
         const val ICON_SHIM = "ICON_SHIM"
+        const val GNSS = "GNSS"
 
-        /** Protocol unknowns — bypasses ALL tag/level filtering. Always reaches file logs. */
-        const val PROTO_UNKNOWN = "PROTO_UNKNOWN"
-
-        // Video Pipeline Debug Tags
-        const val VIDEO_USB = "VIDEO_USB"
-        const val VIDEO_RING_BUFFER = "VIDEO_RING"
-        const val VIDEO_CODEC = "VIDEO_CODEC"
-        const val VIDEO_SURFACE = "VIDEO_SURFACE"
-        const val VIDEO_PERF = "VIDEO_PERF"
-        const val AUDIO_PERF = "AUDIO_PERF"
+        // Video Pipeline Debug Tags (comprehensive video troubleshooting)
+        const val VIDEO_USB = "VIDEO_USB" // USB receive layer
+        const val VIDEO_RING_BUFFER = "VIDEO_RING" // Ring buffer operations
+        const val VIDEO_CODEC = "VIDEO_CODEC" // MediaCodec operations
+        const val VIDEO_SURFACE = "VIDEO_SURFACE" // Surface/rendering
+        const val VIDEO_PERF = "VIDEO_PERF" // Performance metrics
     }
 
+    /**
+     * Debug-only logging control.
+     * When false, verbose debug logs are stripped from release builds.
+     * This is set based on BuildConfig.DEBUG at runtime.
+     */
     @Volatile
     private var debugLoggingEnabled = true
 
-    /** Set debug logging state. In release mode, disables verbose pipeline tags. */
+    /**
+     * Enable or disable debug-only logging.
+     * Call this with BuildConfig.DEBUG on app startup.
+     */
     fun setDebugLoggingEnabled(enabled: Boolean) {
         debugLoggingEnabled = enabled
         if (!enabled) {
@@ -75,12 +97,17 @@ object Logger {
             disableTag(Tags.VIDEO_SURFACE)
             disableTag(Tags.USB_RAW)
             disableTag(Tags.AUDIO_DEBUG)
-            disableTag(Tags.AUDIO_PERF)
         }
     }
 
+    /**
+     * Check if debug logging is enabled (for performance-sensitive code paths).
+     */
     fun isDebugLoggingEnabled(): Boolean = debugLoggingEnabled
 
+    /**
+     * Listener interface for log events.
+     */
     interface LogListener {
         fun onLog(
             level: Level,
@@ -92,10 +119,9 @@ object Logger {
 
     private val enabledTags = ConcurrentHashMap<String, Boolean>()
     private val listeners = CopyOnWriteArrayList<LogListener>()
-
-    @Volatile
     private var minLevel = Level.DEBUG
 
+    // Default enabled tags
     init {
         enableTag(Tags.USB)
         enableTag(Tags.VIDEO)
@@ -106,47 +132,84 @@ object Logger {
         enableTag(Tags.ERROR_RECOVERY)
     }
 
+    /**
+     * Enable logging for a specific tag.
+     */
     fun enableTag(tag: String) {
         enabledTags[tag] = true
     }
 
+    /**
+     * Disable logging for a specific tag.
+     */
     fun disableTag(tag: String) {
         enabledTags[tag] = false
     }
 
-    fun isTagEnabled(tag: String): Boolean = enabledTags[tag] ?: true
+    /**
+     * Check if a tag is enabled.
+     */
+    fun isTagEnabled(tag: String): Boolean {
+        return enabledTags[tag] ?: true // Default to enabled
+    }
 
+    /**
+     * Set the minimum log level.
+     */
     fun setMinLevel(level: Level) {
         minLevel = level
     }
 
+    // ==================== LogPreset Support Methods ====================
+
+    private var logEnabled = true
     private val logLevelEnabled =
         ConcurrentHashMap<LogLevel, Boolean>().apply {
             LogLevel.entries.forEach { put(it, true) }
         }
 
+    /**
+     * Enable or disable all logging globally.
+     */
+    fun setLogEnabled(enabled: Boolean) {
+        logEnabled = enabled
+    }
+
+    /**
+     * Check if logging is globally enabled.
+     */
+    fun isLogEnabled(): Boolean = logEnabled
+
+    /**
+     * Set whether a specific log level is enabled.
+     */
     fun setLogLevel(
         level: LogLevel,
         enabled: Boolean,
     ) {
         logLevelEnabled[level] = enabled
-        // Recalculate to fix release builds staying at ERROR after preset change
-        recalculateMinLevel()
+        // Also update minLevel for Android logging
+        if (!enabled) {
+            val newMinLevel =
+                when {
+                    logLevelEnabled[LogLevel.DEBUG] == true -> Level.DEBUG
+                    logLevelEnabled[LogLevel.INFO] == true -> Level.INFO
+                    logLevelEnabled[LogLevel.WARN] == true -> Level.WARN
+                    logLevelEnabled[LogLevel.ERROR] == true -> Level.ERROR
+                    else -> Level.ERROR
+                }
+            minLevel = newMinLevel
+        }
     }
 
-    private fun recalculateMinLevel() {
-        minLevel =
-            when {
-                logLevelEnabled[LogLevel.DEBUG] == true -> Level.DEBUG
-                logLevelEnabled[LogLevel.INFO] == true -> Level.INFO
-                logLevelEnabled[LogLevel.WARN] == true -> Level.WARN
-                logLevelEnabled[LogLevel.ERROR] == true -> Level.ERROR
-                else -> Level.ERROR
-            }
-    }
-
+    /**
+     * Check if a specific log level is enabled.
+     */
     fun isLogLevelEnabled(level: LogLevel): Boolean = logLevelEnabled[level] ?: true
 
+    /**
+     * Enable multiple tags at once.
+     */
     fun setTagsEnabled(
         tags: List<String>,
         enabled: Boolean,
@@ -156,12 +219,18 @@ object Logger {
         }
     }
 
+    /**
+     * Disable all tags.
+     */
     fun disableAllTags() {
         enabledTags.keys.forEach { tag ->
             enabledTags[tag] = false
         }
     }
 
+    /**
+     * Enable all tags.
+     */
     fun enableAllTags() {
         enabledTags.keys.forEach { tag ->
             enabledTags[tag] = true
@@ -186,64 +255,109 @@ object Logger {
             Tags.USB_RAW,
             Tags.AUDIO_DEBUG,
             Tags.ERROR_RECOVERY,
-            Tags.NAVI,
-            Tags.CLUSTER,
-            Tags.ICON_SHIM,
-            Tags.VIDEO_USB,
-            Tags.VIDEO_RING_BUFFER,
-            Tags.VIDEO_CODEC,
-            Tags.VIDEO_SURFACE,
-            Tags.VIDEO_PERF,
-            Tags.AUDIO_PERF,
         ).forEach { tag ->
             enabledTags[tag] = true
         }
     }
 
+    /**
+     * Get current logging status for debugging.
+     */
+    fun getLoggingStatus(): Map<String, Any> =
+        mapOf(
+            "enabled" to logEnabled,
+            "levels" to logLevelEnabled.toMap(),
+            "tags" to enabledTags.toMap(),
+        )
+
+    /**
+     * Add a log listener.
+     */
     fun addListener(listener: LogListener) {
         listeners.add(listener)
     }
 
+    /**
+     * Remove a log listener.
+     */
     fun removeListener(listener: LogListener) {
         listeners.remove(listener)
     }
 
+    /**
+     * Log a message at VERBOSE level.
+     */
     fun v(
         message: String,
         tag: String? = null,
-    ) = log(Level.VERBOSE, tag, message)
+    ) {
+        log(Level.VERBOSE, tag, message)
+    }
 
+    /**
+     * Log a message at DEBUG level.
+     */
     fun d(
         message: String,
         tag: String? = null,
-    ) = log(Level.DEBUG, tag, message)
+    ) {
+        log(Level.DEBUG, tag, message)
+    }
 
+    /**
+     * Log a message at INFO level.
+     */
     fun i(
         message: String,
         tag: String? = null,
-    ) = log(Level.INFO, tag, message)
+    ) {
+        log(Level.INFO, tag, message)
+    }
 
+    /**
+     * Log a message at WARN level.
+     */
     fun w(
         message: String,
         tag: String? = null,
-    ) = log(Level.WARN, tag, message)
+    ) {
+        log(Level.WARN, tag, message)
+    }
 
+    /**
+     * Log a message at ERROR level.
+     */
     fun e(
         message: String,
         tag: String? = null,
         throwable: Throwable? = null,
-    ) = log(Level.ERROR, tag, message, throwable)
+    ) {
+        log(Level.ERROR, tag, message, throwable)
+    }
 
+    /**
+     * Core logging function.
+     */
     fun log(
         level: Level,
         tag: String?,
         message: String,
         throwable: Throwable? = null,
     ) {
+        // Check level
+        if (level.priority < minLevel.priority) {
+            return
+        }
+
+        // Check tag filter
+        if (tag != null && !isTagEnabled(tag)) {
+            return
+        }
+
         val timestamp = System.currentTimeMillis()
         val formattedMessage = if (tag != null) "[$tag] $message" else message
 
-        // Always emit to Logcat regardless of app settings (enables adb logcat capture)
+        // Log to Android Logcat
         when (level) {
             Level.VERBOSE -> Log.v(TAG, formattedMessage, throwable)
             Level.DEBUG -> Log.d(TAG, formattedMessage, throwable)
@@ -252,14 +366,7 @@ object Logger {
             Level.ERROR -> Log.e(TAG, formattedMessage, throwable)
         }
 
-        // Apply filtering only for listeners (file logging, etc.)
-        // NEVER filter protocol-unknown messages — they must always reach file logs
-        val bypassFilter = tag == Tags.PROTO_UNKNOWN
-        if (!bypassFilter) {
-            if (level.priority < minLevel.priority) return
-            if (tag != null && !isTagEnabled(tag)) return
-        }
-
+        // Notify listeners
         for (listener in listeners) {
             try {
                 listener.onLog(level, tag, message, timestamp)
@@ -270,36 +377,73 @@ object Logger {
     }
 }
 
-// Extension functions
+// ==================== Extension Functions ====================
+
+/**
+ * Log a debug message.
+ */
 fun logDebug(
     message: String,
     tag: String? = null,
-) = Logger.d(message, tag)
+) {
+    Logger.d(message, tag)
+}
 
+/**
+ * Log an info message.
+ */
 fun logInfo(
     message: String,
     tag: String? = null,
-) = Logger.i(message, tag)
+) {
+    Logger.i(message, tag)
+}
 
+/**
+ * Log a warning message.
+ */
 fun logWarn(
     message: String,
     tag: String? = null,
-) = Logger.w(message, tag)
+) {
+    Logger.w(message, tag)
+}
 
+/**
+ * Log an error message.
+ */
 fun logError(
     message: String,
     tag: String? = null,
     throwable: Throwable? = null,
-) = Logger.e(message, tag, throwable)
+) {
+    Logger.e(message, tag, throwable)
+}
 
+/**
+ * Log a message (default to debug level).
+ */
 fun log(
     message: String,
     tag: String? = null,
-) = Logger.d(message, tag)
+) {
+    Logger.d(message, tag)
+}
 
+/**
+ * Check if a tag is enabled for logging.
+ */
 fun isTagEnabled(tag: String): Boolean = Logger.isTagEnabled(tag)
 
-// Debug-only logging - no-op in release builds (avoids string concatenation overhead)
+// ==================== Debug-Only Logging Functions ====================
+// These functions are designed for verbose debug logging that should be
+// disabled in release builds for performance. They check isDebugLoggingEnabled()
+// before logging to avoid string concatenation overhead in release builds.
+
+/**
+ * Log a debug-only message. No-op in release builds.
+ * Use for high-frequency verbose logging in hot paths.
+ */
 inline fun logDebugOnly(
     tag: String,
     message: () -> String,
@@ -309,14 +453,44 @@ inline fun logDebugOnly(
     }
 }
 
-inline fun logVideoUsb(message: () -> String) = logDebugOnly(Logger.Tags.VIDEO_USB, message)
+/**
+ * Log video pipeline USB receive events (debug only).
+ */
+inline fun logVideoUsb(message: () -> String) {
+    logDebugOnly(Logger.Tags.VIDEO_USB, message)
+}
 
-inline fun logVideoCodec(message: () -> String) = logDebugOnly(Logger.Tags.VIDEO_CODEC, message)
+/**
+ * Log video pipeline ring buffer events (debug only).
+ */
+inline fun logVideoRingBuffer(message: () -> String) {
+    logDebugOnly(Logger.Tags.VIDEO_RING_BUFFER, message)
+}
 
-inline fun logVideoSurface(message: () -> String) = logDebugOnly(Logger.Tags.VIDEO_SURFACE, message)
+/**
+ * Log video pipeline codec events (debug only).
+ */
+inline fun logVideoCodec(message: () -> String) {
+    logDebugOnly(Logger.Tags.VIDEO_CODEC, message)
+}
 
-inline fun logVideoPerf(message: () -> String) = logDebugOnly(Logger.Tags.VIDEO_PERF, message)
+/**
+ * Log video pipeline surface events (debug only).
+ */
+inline fun logVideoSurface(message: () -> String) {
+    logDebugOnly(Logger.Tags.VIDEO_SURFACE, message)
+}
 
-inline fun logNavi(message: () -> String) = logDebugOnly(Logger.Tags.NAVI, message)
+/**
+ * Log video pipeline performance metrics (debug only).
+ */
+inline fun logVideoPerf(message: () -> String) {
+    logDebugOnly(Logger.Tags.VIDEO_PERF, message)
+}
 
-inline fun logAudioPerf(message: () -> String) = logDebugOnly(Logger.Tags.AUDIO_PERF, message)
+/**
+ * Log a navigation/cluster event (debug only).
+ */
+inline fun logNavi(message: () -> String) {
+    logDebugOnly(Logger.Tags.NAVI, message)
+}

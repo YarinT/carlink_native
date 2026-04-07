@@ -20,12 +20,6 @@ import com.carlink.logging.logInfo
 class CarlinkClusterService : CarAppService() {
     override fun createHostValidator(): HostValidator = HostValidator.ALLOW_ALL_HOSTS_VALIDATOR
 
-    @Suppress("DEPRECATION")
-    override fun onCreateSession(): Session {
-        logInfo("[CLUSTER_SVC] Creating session (no SessionInfo — fallback)", tag = Logger.Tags.CLUSTER)
-        return ClusterMainSession()
-    }
-
     override fun onCreateSession(sessionInfo: SessionInfo): Session {
         logInfo("[CLUSTER_SVC] Creating session: displayType=${sessionInfo.displayType}", tag = Logger.Tags.CLUSTER)
         return ClusterMainSession()

@@ -1,25 +1,24 @@
 package com.carlink.ui.settings
 
-import android.content.ComponentName
 import android.content.Context
-import android.content.pm.PackageManager
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
-import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.carlink.logging.logError
 import com.carlink.logging.logInfo
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.launch
 
+/**
+ * DataStore instance for adapter configuration preferences.
+ * Following Android best practices: singleton instance at top level.
+ */
 private val Context.adapterConfigDataStore: DataStore<Preferences> by preferencesDataStore(
     name = "carlink_adapter_config_preferences",
 )
@@ -108,30 +107,79 @@ enum class CallQualityConfig(
 }
 
 /**
- * Media delay configuration for adapter audio buffer size.
- * Controls tinyalsa PCM buffer size (pcm_open period_size) on the adapter firmware.
- * Lower values = less audio latency but more susceptible to USB jitter.
- * Higher values = more stable but noticeable audio lag.
+ * Media delay configuration for adapter audio sync.
+ * Controls the mediaDelay parameter sent in BoxSettings.
  */
 enum class MediaDelayConfig(
-    val delayMs: Int,
+    val ms: Int,
 ) {
+    /** 300ms — Lowest latency, may glitch on poor USB */
     LOW(300),
+
+    /** 500ms — Balanced latency and stability */
     MEDIUM(500),
+
+    /** 1000ms — Firmware default (recommended) */
     STANDARD(1000),
+
+    /** 2000ms — Maximum buffer for problematic setups */
     HIGH(2000),
     ;
 
     companion object {
         val DEFAULT = STANDARD
+
+        fun fromMs(ms: Int): MediaDelayConfig = entries.find { it.ms == ms } ?: DEFAULT
     }
 }
 
 /**
- * Frame rate configuration for adapter initialization.
- * Controls the FPS value sent in the OPEN message to the adapter firmware.
- * 30 FPS is default — sufficient for CarPlay UI and reduces thermal/power load.
- * 60 FPS available for smoother animations if the display supports it.
+ * Video resolution configuration for adapter projection.
+ * Supports AUTO (use detected display size) or explicit width×height.
+ */
+data class VideoResolutionConfig(
+    val isAuto: Boolean,
+    val width: Int,
+    val height: Int,
+) {
+    companion object {
+        /** Use detected display resolution (recommended). */
+        val AUTO = VideoResolutionConfig(isAuto = true, width = 0, height = 0)
+
+        /**
+         * Calculate available manual resolution options for the given usable display area.
+         * Returns only resolutions strictly smaller than the usable area.
+         */
+        fun calculateOptions(
+            usableWidth: Int,
+            usableHeight: Int,
+        ): List<VideoResolutionConfig> {
+            val candidates =
+                listOf(
+                    VideoResolutionConfig(false, 1920, 1080),
+                    VideoResolutionConfig(false, 1280, 720),
+                    VideoResolutionConfig(false, 800, 480),
+                )
+            return candidates.filter { it.width < usableWidth && it.height < usableHeight }
+        }
+
+        fun fromString(value: String): VideoResolutionConfig {
+            if (value == "auto") return AUTO
+            val parts = value.split("x")
+            if (parts.size == 2) {
+                val w = parts[0].toIntOrNull() ?: return AUTO
+                val h = parts[1].toIntOrNull() ?: return AUTO
+                return VideoResolutionConfig(false, w, h)
+            }
+            return AUTO
+        }
+    }
+
+    fun toStorageString(): String = if (isAuto) "auto" else "${width}x${height}"
+}
+
+/**
+ * Frame rate configuration for adapter projection.
  */
 enum class FpsConfig(
     val fps: Int,
@@ -142,22 +190,20 @@ enum class FpsConfig(
 
     companion object {
         val DEFAULT = FPS_30
+
+        fun fromFps(fps: Int): FpsConfig = entries.find { it.fps == fps } ?: DEFAULT
     }
 }
 
 /**
- * Hand drive mode configuration for CarPlay/Android Auto UI layout.
- * Controls which side the UI elements are positioned for the driver.
- * Written to /tmp/hand_drive_mode on the adapter (0=LHD, 1=RHD).
+ * Driving side configuration (affects CarPlay UI layout).
  */
-enum class HandDriveConfig(
-    val value: Int,
-) {
-    /** Left Hand Drive — dock on left, for countries that drive on the right (US, Europe). */
-    LEFT(0),
+enum class HandDriveConfig {
+    /** Left-hand traffic — driving on the right side of the road. */
+    LEFT,
 
-    /** Right Hand Drive — dock on right, for countries that drive on the left (UK, Japan, AU). */
-    RIGHT(1),
+    /** Right-hand traffic — driving on the left side of the road. */
+    RIGHT,
     ;
 
     companion object {
@@ -166,76 +212,74 @@ enum class HandDriveConfig(
 }
 
 /**
- * Video resolution configuration for adapter initialization.
- *
- * AUTO uses the detected display resolution (usable area after system UI).
- * Other options are calculated based on the display's aspect ratio to maintain
- * proper proportions while reducing GPU load.
- *
- * Note: Resolution is stored as a string format "WIDTHxHEIGHT" or "AUTO".
+ * Sample rate configuration for adapter audio output.
+ * Controls the mediaSound parameter sent to the adapter during initialization.
  */
-data class VideoResolutionConfig(
-    val width: Int,
-    val height: Int,
+enum class SampleRateConfig(
+    val hz: Int,
+    val mediaSound: Int,
 ) {
-    val isAuto: Boolean get() = width == 0 && height == 0
+    /**
+     * 44.1kHz - Standard CD quality audio.
+     * Adapter sends audio with decodeType 1 or 2.
+     */
+    RATE_44100(44100, 0),
 
-    fun toStorageString(): String = if (isAuto) "AUTO" else "${width}x$height"
+    /**
+     * 48kHz - Professional/high-quality audio (default for GM AAOS).
+     * Adapter sends audio with decodeType 4.
+     */
+    RATE_48000(48000, 1),
+    ;
 
     companion object {
-        val AUTO = VideoResolutionConfig(0, 0)
+        val DEFAULT = RATE_48000
 
-        fun fromStorageString(value: String?): VideoResolutionConfig {
-            if (value == null || value == "AUTO") return AUTO
-            val parts = value.split("x")
-            return if (parts.size == 2) {
-                try {
-                    VideoResolutionConfig(parts[0].toInt(), parts[1].toInt())
-                } catch (e: NumberFormatException) {
-                    AUTO
-                }
-            } else {
-                AUTO
+        fun fromHz(hz: Int): SampleRateConfig =
+            when (hz) {
+                44100 -> RATE_44100
+                48000 -> RATE_48000
+                else -> DEFAULT
             }
-        }
-
-        /**
-         * Calculate resolution options based on display aspect ratio.
-         *
-         * Returns 4 resolution options that maintain the display's aspect ratio,
-         * scaled down from the base resolution. All dimensions are rounded to
-         * even numbers for H.264 compatibility.
-         *
-         * @param displayWidth Native display width in pixels
-         * @param displayHeight Native display height in pixels
-         * @return List of 4 resolution options, largest to smallest
-         */
-        fun calculateOptions(
-            displayWidth: Int,
-            displayHeight: Int,
-        ): List<VideoResolutionConfig> {
-            // Calculate scale factors to generate 4 options
-            // Start from ~93.75% of original, then 83.3%, 72.9%, 62.5%
-            val scaleFactors = listOf(0.9375, 0.833, 0.729, 0.625)
-
-            return scaleFactors.map { scale ->
-                // Scale from display dimensions and round to even
-                val w = ((displayWidth * scale).toInt() and 1.inv())
-                val h = ((displayHeight * scale).toInt() and 1.inv())
-                VideoResolutionConfig(w, h)
-            }
-        }
     }
 }
 
 /**
- * Adapter config preferences with DataStore + SharedPreferences sync cache for ANR-free startup reads.
- * Tracks pending changes for minimal re-initialization on reconnect.
+ * Manages persistent storage of adapter configuration preferences.
+ *
+ * Overview:
+ * Stores user's adapter configuration preferences that are applied during
+ * adapter initialization. Changes take effect on the next connection/restart.
+ *
+ * Design Philosophy:
+ * - All options have sensible defaults (ADAPTER for audio source)
+ * - FULL init sends all settings, minimal init only sends changed settings
+ * - Adapter firmware retains most settings through power cycles
+ *
+ * Storage:
+ * - Uses DataStore Preferences for persistence with SharedPreferences sync cache
+ * - Sync Cache: SharedPreferences for instant startup reads (avoids ANR)
+ * - Preferences survive app restarts
+ * - Applied during AdapterConfig creation in MainActivity
+ *
+ * ANR Prevention:
+ * Uses SharedPreferences as a synchronous cache per Android Developer guidance.
+ * DataStore I/O can block the main thread causing ANR if read synchronously.
+ * SharedPreferences provides instant cached reads at startup while DataStore
+ * remains the source of truth for Flow-based observation.
+ *
+ * Extensibility:
+ * - New configuration options can be added by:
+ *   1. Adding a preference key (both DataStore and sync cache)
+ *   2. Adding getter/setter methods (update sync cache in setter)
+ *   3. Adding Flow for UI observation
+ *   4. Updating getUserConfigSync() and getUserConfig() methods
  */
-@Suppress("StaticFieldLeak")
+@Suppress("StaticFieldLeak") // Uses applicationContext, not Activity context - no leak
 class AdapterConfigPreference private constructor(
     context: Context,
 ) {
+    // Store applicationContext to avoid Activity leaks
     private val appContext: Context = context.applicationContext
 
     companion object {
@@ -248,7 +292,12 @@ class AdapterConfigPreference private constructor(
             }
 
         // Preference keys
+        // Audio source: null = not configured, true = bluetooth, false = adapter
+        private val KEY_AUDIO_SOURCE_CONFIGURED = booleanPreferencesKey("audio_source_configured")
         private val KEY_AUDIO_SOURCE_BLUETOOTH = booleanPreferencesKey("audio_source_bluetooth")
+
+        // Sample rate: stored as Hz value (44100 or 48000)
+        private val KEY_SAMPLE_RATE = intPreferencesKey("sample_rate")
 
         // Mic source: stored as command code (7=phone, 15=adapter)
         private val KEY_MIC_SOURCE = intPreferencesKey("mic_source")
@@ -259,43 +308,43 @@ class AdapterConfigPreference private constructor(
         // Call quality: stored as value (0=normal, 1=clear, 2=HD)
         private val KEY_CALL_QUALITY = intPreferencesKey("call_quality")
 
-        // Media delay: stored as delay in ms (300, 500, 1000, 2000)
+        // Media delay: stored as ms value
         private val KEY_MEDIA_DELAY = intPreferencesKey("media_delay")
 
-        // Video resolution: stored as string "WIDTHxHEIGHT" or "AUTO"
+        // Video resolution: stored as "auto" or "WxH"
         private val KEY_VIDEO_RESOLUTION = stringPreferencesKey("video_resolution")
 
-        // FPS: stored as int (30 or 60)
+        // FPS: stored as fps value (30 or 60)
         private val KEY_FPS = intPreferencesKey("fps")
 
-        // Hand drive mode: stored as int (0=LHD, 1=RHD)
-        private val KEY_HAND_DRIVE = intPreferencesKey("hand_drive_mode")
+        // Hand drive: stored as ordinal (0=LEFT, 1=RIGHT)
+        private val KEY_HAND_DRIVE = intPreferencesKey("hand_drive")
 
-        // GPS forwarding: true = forward vehicle GPS to CarPlay, false = phone uses own GPS
+        // GPS forwarding: stored as boolean
         private val KEY_GPS_FORWARDING = booleanPreferencesKey("gps_forwarding")
 
-        // Cluster navigation: true = show CarPlay turn-by-turn on instrument cluster
-        private val KEY_CLUSTER_NAVIGATION = booleanPreferencesKey("cluster_navigation_enabled")
+        // Cluster navigation: stored as boolean
+        private val KEY_CLUSTER_NAVIGATION = booleanPreferencesKey("cluster_navigation")
 
         // Initialization tracking
         private val KEY_HAS_COMPLETED_FIRST_INIT = booleanPreferencesKey("has_completed_first_init")
-        private val KEY_LAST_INIT_VERSION_CODE = longPreferencesKey("last_init_version_code")
         private val KEY_PENDING_CHANGES = stringSetPreferencesKey("pending_changes")
 
         // SharedPreferences keys for sync cache (ANR prevention)
         private const val SYNC_CACHE_PREFS_NAME = "carlink_adapter_config_sync_cache"
+        private const val SYNC_CACHE_KEY_AUDIO_CONFIGURED = "audio_source_configured"
         private const val SYNC_CACHE_KEY_AUDIO_BLUETOOTH = "audio_source_bluetooth"
+        private const val SYNC_CACHE_KEY_SAMPLE_RATE = "sample_rate"
         private const val SYNC_CACHE_KEY_MIC_SOURCE = "mic_source"
         private const val SYNC_CACHE_KEY_WIFI_BAND = "wifi_band"
         private const val SYNC_CACHE_KEY_CALL_QUALITY = "call_quality"
         private const val SYNC_CACHE_KEY_MEDIA_DELAY = "media_delay"
         private const val SYNC_CACHE_KEY_VIDEO_RESOLUTION = "video_resolution"
         private const val SYNC_CACHE_KEY_FPS = "fps"
-        private const val SYNC_CACHE_KEY_HAND_DRIVE = "hand_drive_mode"
+        private const val SYNC_CACHE_KEY_HAND_DRIVE = "hand_drive"
         private const val SYNC_CACHE_KEY_GPS_FORWARDING = "gps_forwarding"
-        private const val SYNC_CACHE_KEY_CLUSTER_NAVIGATION = "cluster_navigation_enabled"
+        private const val SYNC_CACHE_KEY_CLUSTER_NAVIGATION = "cluster_navigation"
         private const val SYNC_CACHE_KEY_HAS_COMPLETED_FIRST_INIT = "has_completed_first_init"
-        private const val SYNC_CACHE_KEY_LAST_INIT_VERSION_CODE = "last_init_version_code"
         private const val SYNC_CACHE_KEY_PENDING_CHANGES = "pending_changes"
 
         /**
@@ -304,25 +353,29 @@ class AdapterConfigPreference private constructor(
          */
         object ConfigKey {
             const val AUDIO_SOURCE = "audio_source"
+            const val SAMPLE_RATE = "sample_rate"
             const val MIC_SOURCE = "mic_source"
             const val WIFI_BAND = "wifi_band"
             const val CALL_QUALITY = "call_quality"
-            const val MEDIA_DELAY = "media_delay"
-            const val VIDEO_RESOLUTION = "video_resolution"
-            const val FPS = "fps"
-            const val HAND_DRIVE = "hand_drive_mode"
-            const val GPS_FORWARDING = "gps_forwarding"
         }
     }
 
     private val dataStore = appContext.adapterConfigDataStore
 
+    // SharedPreferences sync cache for instant startup reads
+    // Per Android Developer guidance: use SharedPreferences for synchronous access
+    // to avoid blocking main thread with DataStore I/O
     private val syncCache =
         appContext.getSharedPreferences(
             SYNC_CACHE_PREFS_NAME,
             Context.MODE_PRIVATE,
         )
 
+    // ==================== Audio Source ====================
+
+    /**
+     * Flow for observing audio source configuration changes.
+     */
     val audioSourceFlow: Flow<AudioSourceConfig> =
         dataStore.data.map { preferences ->
             val isBluetooth = preferences[KEY_AUDIO_SOURCE_BLUETOOTH] ?: false
@@ -339,6 +392,21 @@ class AdapterConfigPreference private constructor(
         val isBluetooth = syncCache.getBoolean(SYNC_CACHE_KEY_AUDIO_BLUETOOTH, false)
         return if (isBluetooth) AudioSourceConfig.BLUETOOTH else AudioSourceConfig.ADAPTER
     }
+
+    /**
+     * Get current audio source configuration.
+     *
+     * Note: Prefer getAudioSourceSync() for startup reads to avoid ANR.
+     */
+    suspend fun getAudioSource(): AudioSourceConfig =
+        try {
+            val preferences = dataStore.data.first()
+            val isBluetooth = preferences[KEY_AUDIO_SOURCE_BLUETOOTH] ?: false
+            if (isBluetooth) AudioSourceConfig.BLUETOOTH else AudioSourceConfig.ADAPTER
+        } catch (e: Exception) {
+            logError("Failed to read audio source preference: $e", tag = "AdapterConfig")
+            AudioSourceConfig.DEFAULT
+        }
 
     /**
      * Set audio source configuration.
@@ -362,6 +430,69 @@ class AdapterConfigPreference private constructor(
         }
     }
 
+    // ==================== Sample Rate ====================
+
+    /**
+     * Flow for observing sample rate configuration changes.
+     */
+    val sampleRateFlow: Flow<SampleRateConfig> =
+        dataStore.data.map { preferences ->
+            val hz = preferences[KEY_SAMPLE_RATE] ?: SampleRateConfig.DEFAULT.hz
+            SampleRateConfig.fromHz(hz)
+        }
+
+    /**
+     * Get current sample rate configuration synchronously.
+     * Uses SharedPreferences cache to avoid ANR.
+     *
+     * This is safe to call from the main thread during Activity.onCreate().
+     */
+    fun getSampleRateSync(): SampleRateConfig {
+        val hz = syncCache.getInt(SYNC_CACHE_KEY_SAMPLE_RATE, SampleRateConfig.DEFAULT.hz)
+        return SampleRateConfig.fromHz(hz)
+    }
+
+    /**
+     * Get current sample rate configuration.
+     *
+     * Note: Prefer getSampleRateSync() for startup reads to avoid ANR.
+     */
+    suspend fun getSampleRate(): SampleRateConfig =
+        try {
+            val preferences = dataStore.data.first()
+            val hz = preferences[KEY_SAMPLE_RATE] ?: SampleRateConfig.DEFAULT.hz
+            SampleRateConfig.fromHz(hz)
+        } catch (e: Exception) {
+            logError("Failed to read sample rate preference: $e", tag = "AdapterConfig")
+            SampleRateConfig.DEFAULT
+        }
+
+    /**
+     * Set sample rate configuration.
+     * Updates both DataStore and sync cache atomically.
+     */
+    suspend fun setSampleRate(config: SampleRateConfig) {
+        try {
+            // Update DataStore (source of truth)
+            dataStore.edit { preferences ->
+                preferences[KEY_SAMPLE_RATE] = config.hz
+            }
+            // Update sync cache for instant reads on next startup
+            syncCache.edit().putInt(SYNC_CACHE_KEY_SAMPLE_RATE, config.hz).apply()
+            // Track as pending change for next initialization
+            addPendingChange(ConfigKey.SAMPLE_RATE)
+            logInfo("Sample rate preference saved: $config (${config.hz}Hz)", tag = "AdapterConfig")
+        } catch (e: Exception) {
+            logError("Failed to save sample rate preference: $e", tag = "AdapterConfig")
+            throw e
+        }
+    }
+
+    // ==================== Mic Source ====================
+
+    /**
+     * Flow for observing mic source configuration changes.
+     */
     val micSourceFlow: Flow<MicSourceConfig> =
         dataStore.data.map { preferences ->
             val code = preferences[KEY_MIC_SOURCE] ?: MicSourceConfig.DEFAULT.commandCode
@@ -393,6 +524,11 @@ class AdapterConfigPreference private constructor(
         }
     }
 
+    // ==================== WiFi Band ====================
+
+    /**
+     * Flow for observing WiFi band configuration changes.
+     */
     val wifiBandFlow: Flow<WiFiBandConfig> =
         dataStore.data.map { preferences ->
             val code = preferences[KEY_WIFI_BAND] ?: WiFiBandConfig.DEFAULT.commandCode
@@ -424,6 +560,11 @@ class AdapterConfigPreference private constructor(
         }
     }
 
+    // ==================== Call Quality ====================
+
+    /**
+     * Flow for observing call quality configuration changes.
+     */
     val callQualityFlow: Flow<CallQualityConfig> =
         dataStore.data.map { preferences ->
             val value = preferences[KEY_CALL_QUALITY] ?: CallQualityConfig.DEFAULT.value
@@ -455,168 +596,109 @@ class AdapterConfigPreference private constructor(
         }
     }
 
+    // ==================== Media Delay ====================
+
     val mediaDelayFlow: Flow<MediaDelayConfig> =
-        dataStore.data.map { preferences ->
-            val value = preferences[KEY_MEDIA_DELAY] ?: MediaDelayConfig.DEFAULT.delayMs
-            MediaDelayConfig.entries.find { it.delayMs == value } ?: MediaDelayConfig.DEFAULT
+        dataStore.data.map { prefs ->
+            MediaDelayConfig.fromMs(prefs[KEY_MEDIA_DELAY] ?: MediaDelayConfig.DEFAULT.ms)
         }
 
-    /**
-     * Get current media delay configuration synchronously.
-     */
-    fun getMediaDelaySync(): MediaDelayConfig {
-        val value = syncCache.getInt(SYNC_CACHE_KEY_MEDIA_DELAY, MediaDelayConfig.DEFAULT.delayMs)
-        return MediaDelayConfig.entries.find { it.delayMs == value } ?: MediaDelayConfig.DEFAULT
-    }
+    fun getMediaDelaySync(): MediaDelayConfig =
+        MediaDelayConfig.fromMs(syncCache.getInt(SYNC_CACHE_KEY_MEDIA_DELAY, MediaDelayConfig.DEFAULT.ms))
 
-    /**
-     * Set media delay configuration.
-     */
     suspend fun setMediaDelay(config: MediaDelayConfig) {
         try {
-            dataStore.edit { preferences ->
-                preferences[KEY_MEDIA_DELAY] = config.delayMs
-            }
-            syncCache.edit().putInt(SYNC_CACHE_KEY_MEDIA_DELAY, config.delayMs).apply()
-            addPendingChange(ConfigKey.MEDIA_DELAY)
-            logInfo("Media delay preference saved: $config (${config.delayMs}ms)", tag = "AdapterConfig")
+            dataStore.edit { prefs -> prefs[KEY_MEDIA_DELAY] = config.ms }
+            syncCache.edit().putInt(SYNC_CACHE_KEY_MEDIA_DELAY, config.ms).apply()
+            logInfo("Media delay preference saved: $config (${config.ms}ms)", tag = "AdapterConfig")
         } catch (e: Exception) {
             logError("Failed to save media delay preference: $e", tag = "AdapterConfig")
             throw e
         }
     }
 
+    // ==================== Video Resolution ====================
+
     val videoResolutionFlow: Flow<VideoResolutionConfig> =
-        dataStore.data.map { preferences ->
-            val value = preferences[KEY_VIDEO_RESOLUTION]
-            VideoResolutionConfig.fromStorageString(value)
+        dataStore.data.map { prefs ->
+            VideoResolutionConfig.fromString(prefs[KEY_VIDEO_RESOLUTION] ?: "auto")
         }
 
-    /**
-     * Get current video resolution configuration synchronously.
-     * Returns AUTO if not configured.
-     */
-    fun getVideoResolutionSync(): VideoResolutionConfig {
-        val value = syncCache.getString(SYNC_CACHE_KEY_VIDEO_RESOLUTION, "AUTO")
-        return VideoResolutionConfig.fromStorageString(value)
-    }
+    fun getVideoResolutionSync(): VideoResolutionConfig =
+        VideoResolutionConfig.fromString(
+            syncCache.getString(SYNC_CACHE_KEY_VIDEO_RESOLUTION, "auto") ?: "auto",
+        )
 
-    /**
-     * Set video resolution configuration.
-     */
     suspend fun setVideoResolution(config: VideoResolutionConfig) {
         try {
-            val storageValue = config.toStorageString()
-            dataStore.edit { preferences ->
-                preferences[KEY_VIDEO_RESOLUTION] = storageValue
-            }
-            syncCache.edit().putString(SYNC_CACHE_KEY_VIDEO_RESOLUTION, storageValue).apply()
-            addPendingChange(ConfigKey.VIDEO_RESOLUTION)
-            logInfo("Video resolution preference saved: $storageValue", tag = "AdapterConfig")
+            val stored = config.toStorageString()
+            dataStore.edit { prefs -> prefs[KEY_VIDEO_RESOLUTION] = stored }
+            syncCache.edit().putString(SYNC_CACHE_KEY_VIDEO_RESOLUTION, stored).apply()
+            logInfo("Video resolution preference saved: $config", tag = "AdapterConfig")
         } catch (e: Exception) {
             logError("Failed to save video resolution preference: $e", tag = "AdapterConfig")
             throw e
         }
     }
 
-    /**
-     * Set video resolution synchronously (sync cache only).
-     * Used during display mode reinit where the 200ms handler must read the updated value
-     * immediately. The DataStore write is deferred to next setVideoResolution() call.
-     */
-    fun setVideoResolutionSync(config: VideoResolutionConfig) {
-        val storageValue = config.toStorageString()
-        syncCache.edit().putString(SYNC_CACHE_KEY_VIDEO_RESOLUTION, storageValue).apply()
-        // DataStore pending change write is async — fire and forget since the sync cache
-        // is the source of truth for getUserConfigSync() reads during reinit.
-        CoroutineScope(Dispatchers.IO).launch {
-            addPendingChange(ConfigKey.VIDEO_RESOLUTION)
-        }
-        logInfo("Video resolution sync cache updated: $storageValue", tag = "AdapterConfig")
-    }
+    // ==================== FPS ====================
 
     val fpsFlow: Flow<FpsConfig> =
-        dataStore.data.map { preferences ->
-            val value = preferences[KEY_FPS] ?: FpsConfig.DEFAULT.fps
-            FpsConfig.entries.find { it.fps == value } ?: FpsConfig.DEFAULT
+        dataStore.data.map { prefs ->
+            FpsConfig.fromFps(prefs[KEY_FPS] ?: FpsConfig.DEFAULT.fps)
         }
 
-    /**
-     * Get current FPS configuration synchronously.
-     */
-    fun getFpsSync(): FpsConfig {
-        val value = syncCache.getInt(SYNC_CACHE_KEY_FPS, FpsConfig.DEFAULT.fps)
-        return FpsConfig.entries.find { it.fps == value } ?: FpsConfig.DEFAULT
-    }
+    fun getFpsSync(): FpsConfig =
+        FpsConfig.fromFps(syncCache.getInt(SYNC_CACHE_KEY_FPS, FpsConfig.DEFAULT.fps))
 
-    /**
-     * Set FPS configuration.
-     */
     suspend fun setFps(config: FpsConfig) {
         try {
-            dataStore.edit { preferences ->
-                preferences[KEY_FPS] = config.fps
-            }
+            dataStore.edit { prefs -> prefs[KEY_FPS] = config.fps }
             syncCache.edit().putInt(SYNC_CACHE_KEY_FPS, config.fps).apply()
-            addPendingChange(ConfigKey.FPS)
-            logInfo("FPS preference saved: ${config.fps}", tag = "AdapterConfig")
+            logInfo("FPS preference saved: $config", tag = "AdapterConfig")
         } catch (e: Exception) {
             logError("Failed to save FPS preference: $e", tag = "AdapterConfig")
             throw e
         }
     }
 
+    // ==================== Hand Drive ====================
+
     val handDriveFlow: Flow<HandDriveConfig> =
-        dataStore.data.map { preferences ->
-            val value = preferences[KEY_HAND_DRIVE] ?: HandDriveConfig.DEFAULT.value
-            HandDriveConfig.entries.find { it.value == value } ?: HandDriveConfig.DEFAULT
+        dataStore.data.map { prefs ->
+            val ordinal = prefs[KEY_HAND_DRIVE] ?: HandDriveConfig.DEFAULT.ordinal
+            HandDriveConfig.entries.getOrElse(ordinal) { HandDriveConfig.DEFAULT }
         }
 
-    /**
-     * Get current hand drive configuration synchronously.
-     */
     fun getHandDriveSync(): HandDriveConfig {
-        val value = syncCache.getInt(SYNC_CACHE_KEY_HAND_DRIVE, HandDriveConfig.DEFAULT.value)
-        return HandDriveConfig.entries.find { it.value == value } ?: HandDriveConfig.DEFAULT
+        val ordinal = syncCache.getInt(SYNC_CACHE_KEY_HAND_DRIVE, HandDriveConfig.DEFAULT.ordinal)
+        return HandDriveConfig.entries.getOrElse(ordinal) { HandDriveConfig.DEFAULT }
     }
 
-    /**
-     * Set hand drive configuration.
-     */
     suspend fun setHandDrive(config: HandDriveConfig) {
         try {
-            dataStore.edit { preferences ->
-                preferences[KEY_HAND_DRIVE] = config.value
-            }
-            syncCache.edit().putInt(SYNC_CACHE_KEY_HAND_DRIVE, config.value).apply()
-            addPendingChange(ConfigKey.HAND_DRIVE)
-            logInfo("Hand drive preference saved: $config (${config.value})", tag = "AdapterConfig")
+            dataStore.edit { prefs -> prefs[KEY_HAND_DRIVE] = config.ordinal }
+            syncCache.edit().putInt(SYNC_CACHE_KEY_HAND_DRIVE, config.ordinal).apply()
+            logInfo("Hand drive preference saved: $config", tag = "AdapterConfig")
         } catch (e: Exception) {
             logError("Failed to save hand drive preference: $e", tag = "AdapterConfig")
             throw e
         }
     }
 
+    // ==================== GPS Forwarding ====================
+
     val gpsForwardingFlow: Flow<Boolean> =
-        dataStore.data.map { preferences ->
-            preferences[KEY_GPS_FORWARDING] ?: false
+        dataStore.data.map { prefs ->
+            prefs[KEY_GPS_FORWARDING] ?: false
         }
 
-    /**
-     * Get current GPS forwarding configuration synchronously.
-     */
     fun getGpsForwardingSync(): Boolean = syncCache.getBoolean(SYNC_CACHE_KEY_GPS_FORWARDING, false)
 
-    /**
-     * Set GPS forwarding configuration.
-     */
     suspend fun setGpsForwarding(enabled: Boolean) {
         try {
-            dataStore.edit { preferences ->
-                preferences[KEY_GPS_FORWARDING] = enabled
-            }
+            dataStore.edit { prefs -> prefs[KEY_GPS_FORWARDING] = enabled }
             syncCache.edit().putBoolean(SYNC_CACHE_KEY_GPS_FORWARDING, enabled).apply()
-            addPendingChange(ConfigKey.GPS_FORWARDING)
             logInfo("GPS forwarding preference saved: $enabled", tag = "AdapterConfig")
         } catch (e: Exception) {
             logError("Failed to save GPS forwarding preference: $e", tag = "AdapterConfig")
@@ -624,25 +706,18 @@ class AdapterConfigPreference private constructor(
         }
     }
 
+    // ==================== Cluster Navigation ====================
+
     val clusterNavigationFlow: Flow<Boolean> =
-        dataStore.data.map { preferences ->
-            preferences[KEY_CLUSTER_NAVIGATION] ?: false
+        dataStore.data.map { prefs ->
+            prefs[KEY_CLUSTER_NAVIGATION] ?: false
         }
 
-    /**
-     * Get current cluster navigation configuration synchronously.
-     */
     fun getClusterNavigationSync(): Boolean = syncCache.getBoolean(SYNC_CACHE_KEY_CLUSTER_NAVIGATION, false)
 
-    /**
-     * Set cluster navigation configuration.
-     * This is a local app setting — does NOT call addPendingChange() (not an adapter config).
-     */
     suspend fun setClusterNavigation(enabled: Boolean) {
         try {
-            dataStore.edit { preferences ->
-                preferences[KEY_CLUSTER_NAVIGATION] = enabled
-            }
+            dataStore.edit { prefs -> prefs[KEY_CLUSTER_NAVIGATION] = enabled }
             syncCache.edit().putBoolean(SYNC_CACHE_KEY_CLUSTER_NAVIGATION, enabled).apply()
             logInfo("Cluster navigation preference saved: $enabled", tag = "AdapterConfig")
         } catch (e: Exception) {
@@ -651,57 +726,31 @@ class AdapterConfigPreference private constructor(
         }
     }
 
-    /**
-     * Apply the cluster service component enabled/disabled state based on preference.
-     * Call this early in Activity.onCreate() so the state is set before Templates Host discovers it.
-     */
-    fun applyClusterComponentState(context: Context) {
-        val enabled = getClusterNavigationSync()
-        val newState =
-            if (enabled) {
-                PackageManager.COMPONENT_ENABLED_STATE_ENABLED
-            } else {
-                PackageManager.COMPONENT_ENABLED_STATE_DISABLED
-            }
-        context.packageManager.setComponentEnabledSetting(
-            ComponentName(context, "com.carlink.cluster.CarlinkClusterService"),
-            newState,
-            PackageManager.DONT_KILL_APP,
-        )
-    }
+    // ==================== Configuration Summary ====================
 
+    /**
+     * Data class containing all user-configured adapter settings.
+     */
     data class UserConfig(
         /** Audio transfer mode: true = bluetooth, false = adapter (default) */
         val audioTransferMode: Boolean,
+        /** Sample rate configuration for media audio */
+        val sampleRate: SampleRateConfig,
         /** Microphone source configuration */
         val micSource: MicSourceConfig,
         /** WiFi band configuration */
         val wifiBand: WiFiBandConfig,
         /** Call quality configuration */
         val callQuality: CallQualityConfig,
-        /** Media delay configuration */
-        val mediaDelay: MediaDelayConfig,
-        /** Video resolution configuration */
-        val videoResolution: VideoResolutionConfig,
-        /** Frame rate configuration */
-        val fps: FpsConfig,
-        /** Hand drive mode configuration */
-        val handDrive: HandDriveConfig,
-        /** GPS forwarding: true = forward vehicle GPS to CarPlay, false = phone uses own GPS */
-        val gpsForwarding: Boolean = false,
     ) {
         companion object {
             val DEFAULT =
                 UserConfig(
-                    audioTransferMode = false, // ADAPTER is default
+                    audioTransferMode = true, // BLUETOOTH is default
+                    sampleRate = SampleRateConfig.DEFAULT,
                     micSource = MicSourceConfig.DEFAULT,
                     wifiBand = WiFiBandConfig.DEFAULT,
                     callQuality = CallQualityConfig.DEFAULT,
-                    mediaDelay = MediaDelayConfig.DEFAULT,
-                    videoResolution = VideoResolutionConfig.AUTO,
-                    fps = FpsConfig.DEFAULT,
-                    handDrive = HandDriveConfig.DEFAULT,
-                    gpsForwarding = false,
                 )
         }
     }
@@ -714,24 +763,33 @@ class AdapterConfigPreference private constructor(
      */
     fun getUserConfigSync(): UserConfig {
         val audioSource = getAudioSourceSync()
+        val sampleRate = getSampleRateSync()
         val micSource = getMicSourceSync()
         val wifiBand = getWifiBandSync()
         val callQuality = getCallQualitySync()
-        val mediaDelay = getMediaDelaySync()
-        val videoResolution = getVideoResolutionSync()
-        val fps = getFpsSync()
-        val handDrive = getHandDriveSync()
-        val gpsForwarding = getGpsForwardingSync()
         return UserConfig(
             audioTransferMode = audioSource == AudioSourceConfig.BLUETOOTH,
+            sampleRate = sampleRate,
             micSource = micSource,
             wifiBand = wifiBand,
             callQuality = callQuality,
-            mediaDelay = mediaDelay,
-            videoResolution = videoResolution,
-            fps = fps,
-            handDrive = handDrive,
-            gpsForwarding = gpsForwarding,
+        )
+    }
+
+    /**
+     * Get all user-configured settings as a single object.
+     *
+     * Note: Prefer getUserConfigSync() for startup reads to avoid ANR.
+     */
+    suspend fun getUserConfig(): UserConfig {
+        val audioSource = getAudioSource()
+        val sampleRate = getSampleRate()
+        return UserConfig(
+            audioTransferMode = audioSource == AudioSourceConfig.BLUETOOTH,
+            sampleRate = sampleRate,
+            micSource = getMicSourceSync(),
+            wifiBand = getWifiBandSync(),
+            callQuality = getCallQualitySync(),
         )
     }
 
@@ -743,49 +801,54 @@ class AdapterConfigPreference private constructor(
         try {
             // Clear DataStore
             dataStore.edit { preferences ->
+                preferences.remove(KEY_AUDIO_SOURCE_CONFIGURED)
                 preferences.remove(KEY_AUDIO_SOURCE_BLUETOOTH)
+                preferences.remove(KEY_SAMPLE_RATE)
                 preferences.remove(KEY_MIC_SOURCE)
                 preferences.remove(KEY_WIFI_BAND)
                 preferences.remove(KEY_CALL_QUALITY)
-                preferences.remove(KEY_MEDIA_DELAY)
-                preferences.remove(KEY_VIDEO_RESOLUTION)
-                preferences.remove(KEY_FPS)
-                preferences.remove(KEY_HAND_DRIVE)
-                preferences.remove(KEY_GPS_FORWARDING)
-                preferences.remove(KEY_CLUSTER_NAVIGATION)
-                preferences.remove(KEY_HAS_COMPLETED_FIRST_INIT)
-                preferences.remove(KEY_LAST_INIT_VERSION_CODE)
-                preferences.remove(KEY_PENDING_CHANGES)
             }
             // Clear sync cache
             syncCache
                 .edit()
                 .apply {
+                    remove(SYNC_CACHE_KEY_AUDIO_CONFIGURED)
                     remove(SYNC_CACHE_KEY_AUDIO_BLUETOOTH)
+                    remove(SYNC_CACHE_KEY_SAMPLE_RATE)
                     remove(SYNC_CACHE_KEY_MIC_SOURCE)
                     remove(SYNC_CACHE_KEY_WIFI_BAND)
                     remove(SYNC_CACHE_KEY_CALL_QUALITY)
-                    remove(SYNC_CACHE_KEY_MEDIA_DELAY)
-                    remove(SYNC_CACHE_KEY_VIDEO_RESOLUTION)
-                    remove(SYNC_CACHE_KEY_FPS)
-                    remove(SYNC_CACHE_KEY_HAND_DRIVE)
-                    remove(SYNC_CACHE_KEY_GPS_FORWARDING)
-                    remove(SYNC_CACHE_KEY_CLUSTER_NAVIGATION)
-                    remove(SYNC_CACHE_KEY_HAS_COMPLETED_FIRST_INIT)
-                    remove(SYNC_CACHE_KEY_LAST_INIT_VERSION_CODE)
-                    remove(SYNC_CACHE_KEY_PENDING_CHANGES)
                 }.apply()
-            logInfo(
-                "Adapter config preferences reset to defaults" +
-                    " (sync cache cleared, next session will run FULL init)",
-                tag = "AdapterConfig",
-            )
+            logInfo("Adapter config preferences reset to defaults (sync cache cleared)", tag = "AdapterConfig")
         } catch (e: Exception) {
             logError("Failed to reset adapter config preferences: $e", tag = "AdapterConfig")
             throw e
         }
     }
 
+    /**
+     * Get a summary of current preferences for debugging.
+     */
+    suspend fun getPreferencesSummary(): Map<String, Any?> {
+        val audioSource = getAudioSource()
+        val sampleRate = getSampleRate()
+        return mapOf(
+            "audioSource" to audioSource.name,
+            "audioTransferMode" to if (audioSource == AudioSourceConfig.BLUETOOTH) "true (bluetooth)" else "false (adapter)",
+            "sampleRate" to "${sampleRate.hz}Hz",
+            "micSource" to getMicSourceSync().name,
+            "wifiBand" to getWifiBandSync().name,
+            "callQuality" to getCallQualitySync().name,
+            "hasCompletedFirstInit" to hasCompletedFirstInitSync(),
+            "pendingChanges" to getPendingChangesSync(),
+        )
+    }
+
+    // ==================== Initialization Tracking ====================
+
+    /**
+     * Initialization mode for adapter configuration.
+     */
     enum class InitMode {
         /** First launch - send full configuration */
         FULL,
@@ -815,13 +878,6 @@ class AdapterConfigPreference private constructor(
         } catch (e: Exception) {
             logError("Failed to mark first init completed: $e", tag = "AdapterConfig")
         }
-    }
-
-    fun getLastInitVersionCode(): Long = syncCache.getLong(SYNC_CACHE_KEY_LAST_INIT_VERSION_CODE, 0L)
-
-    suspend fun updateLastInitVersionCode(versionCode: Long) {
-        dataStore.edit { it[KEY_LAST_INIT_VERSION_CODE] = versionCode }
-        syncCache.edit().putLong(SYNC_CACHE_KEY_LAST_INIT_VERSION_CODE, versionCode).apply()
     }
 
     /**
@@ -866,17 +922,14 @@ class AdapterConfigPreference private constructor(
     /**
      * Determine the initialization mode based on current state.
      *
-     * @param currentVersionCode The app's current versionCode for version-triggered full init
      * @return InitMode indicating what configuration to send
      */
-    fun getInitializationMode(currentVersionCode: Long): InitMode {
+    fun getInitializationMode(): InitMode {
         val hasCompletedFirstInit = hasCompletedFirstInitSync()
         val pendingChanges = getPendingChangesSync()
-        val lastInitVersion = getLastInitVersionCode()
 
         return when {
             !hasCompletedFirstInit -> InitMode.FULL
-            lastInitVersion != currentVersionCode -> InitMode.FULL
             pendingChanges.isNotEmpty() -> InitMode.MINIMAL_PLUS_CHANGES
             else -> InitMode.MINIMAL_ONLY
         }
@@ -885,26 +938,13 @@ class AdapterConfigPreference private constructor(
     /**
      * Get initialization info for logging.
      */
-    fun getInitializationInfo(currentVersionCode: Long): String {
-        val mode = getInitializationMode(currentVersionCode)
+    fun getInitializationInfo(): String {
+        val mode = getInitializationMode()
         val pendingChanges = getPendingChangesSync()
-        val lastInitVersion = getLastInitVersionCode()
         return when (mode) {
-            InitMode.FULL -> {
-                if (!hasCompletedFirstInitSync()) {
-                    "FULL (first launch)"
-                } else {
-                    "FULL (version $lastInitVersion → $currentVersionCode)"
-                }
-            }
-
-            InitMode.MINIMAL_PLUS_CHANGES -> {
-                "MINIMAL + changes: $pendingChanges"
-            }
-
-            InitMode.MINIMAL_ONLY -> {
-                "MINIMAL (no changes)"
-            }
+            InitMode.FULL -> "FULL (first launch)"
+            InitMode.MINIMAL_PLUS_CHANGES -> "MINIMAL + changes: $pendingChanges"
+            InitMode.MINIMAL_ONLY -> "MINIMAL (no changes)"
         }
     }
 }

@@ -77,15 +77,22 @@ class ClusterMainSession : Session() {
         /** First live session wins; cleared on destroy so a fresh binding chain can take over. */
         @Volatile
         private var primarySession: ClusterMainSession? = null
+
+        /** Lock for atomic primary-session claim/release. */
+        private val primarySessionLock = Any()
     }
 
     override fun onCreateScreen(intent: Intent): Screen {
         ClusterBindingState.sessionAlive = true
 
         // Claim primary role if no other session holds it.
-        isPrimary = primarySession == null
+        // Synchronized: @Volatile alone does not make the check-then-act atomic.
+        // Two concurrent onCreateScreen() calls could both see null and both claim primary.
+        synchronized(primarySessionLock) {
+            isPrimary = primarySession == null
+            if (isPrimary) primarySession = this
+        }
         if (isPrimary) {
-            primarySession = this
             logInfo("[CLUSTER_MAIN] Primary session created — owns NavigationManager", tag = Logger.Tags.CLUSTER)
         } else {
             logInfo("[CLUSTER_MAIN] Secondary session created — passive (no NavigationManager calls)", tag = Logger.Tags.CLUSTER)
@@ -144,7 +151,7 @@ class ClusterMainSession : Session() {
             object : DefaultLifecycleObserver {
                 override fun onDestroy(owner: LifecycleOwner) {
                     if (isPrimary) {
-                        primarySession = null
+                        synchronized(primarySessionLock) { primarySession = null }
                         logInfo(
                             "[CLUSTER_MAIN] Primary session destroyed — releasing NavigationManager ownership",
                             tag = Logger.Tags.CLUSTER,
@@ -247,23 +254,31 @@ class ClusterMainSession : Session() {
                             "starting ${ARRIVAL_TIMEOUT_MS / 1000}s arrival timeout",
                         tag = Logger.Tags.CLUSTER,
                     )
-                    arrivalTimeoutJob = scope?.launch {
-                        delay(ARRIVAL_TIMEOUT_MS)
-                        if (isNavigating) {
-                            logInfo(
-                                "[CLUSTER_MAIN] Arrival timeout — adapter did not send flush, ending navigation",
-                                tag = Logger.Tags.CLUSTER,
-                            )
-                            try {
-                                navManager.navigationEnded()
-                            } catch (e: Exception) {
-                                logError(
-                                    "[CLUSTER_MAIN] navigationEnded() failed (arrival timeout): ${e.message}",
+                    val currentScope = scope
+                    if (currentScope == null) {
+                        logWarn(
+                            "[CLUSTER_MAIN] Scope already destroyed — cannot start arrival timeout",
+                            tag = Logger.Tags.CLUSTER,
+                        )
+                    } else {
+                        arrivalTimeoutJob = currentScope.launch {
+                            delay(ARRIVAL_TIMEOUT_MS)
+                            if (isNavigating) {
+                                logInfo(
+                                    "[CLUSTER_MAIN] Arrival timeout — adapter did not send flush, ending navigation",
                                     tag = Logger.Tags.CLUSTER,
-                                    throwable = e,
                                 )
+                                try {
+                                    navManager.navigationEnded()
+                                } catch (e: Exception) {
+                                    logError(
+                                        "[CLUSTER_MAIN] navigationEnded() failed (arrival timeout): ${e.message}",
+                                        tag = Logger.Tags.CLUSTER,
+                                        throwable = e,
+                                    )
+                                }
+                                isNavigating = false
                             }
-                            isNavigating = false
                         }
                     }
                 }

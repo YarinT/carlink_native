@@ -15,7 +15,21 @@ import androidx.compose.ui.viewinterop.AndroidView
 import com.carlink.logging.logInfo
 import com.carlink.logging.logWarn
 
-/** Compose wrapper for VideoSurfaceView. Uses HWC overlay for low-latency rendering. */
+/**
+ * Video Surface Component for H.264 Video Rendering
+ *
+ * Wraps a custom VideoSurfaceView (SurfaceView) for hardware-accelerated video playback.
+ * Uses HWC overlay path for optimal performance - no GPU composition overhead.
+ *
+ * OPTIMIZATION: SurfaceView provides:
+ * - Direct HWC overlay rendering (bypasses GPU composition)
+ * - Lower latency than TextureView
+ * - Lower power consumption
+ * - DRM content support
+ *
+ * Touch events are handled directly by the VideoSurfaceView and forwarded
+ * to the callback for CarPlay/Android Auto gesture handling.
+ */
 @Composable
 fun VideoSurface(
     modifier: Modifier = Modifier,
@@ -68,8 +82,14 @@ fun VideoSurface(
     )
 }
 
+/**
+ * State holder for video surface
+ */
 class VideoSurfaceState {
     var surface: Surface? by mutableStateOf(null)
+        private set
+
+    var isCreated: Boolean by mutableStateOf(false)
         private set
 
     var width: Int by mutableIntStateOf(0)
@@ -86,10 +106,12 @@ class VideoSurfaceState {
         this.surface = surface
         width = w
         height = h
+        isCreated = true
     }
 
     fun onSurfaceDestroyed() {
         surface = null
+        isCreated = false
     }
 
     fun onSurfaceSizeChanged(

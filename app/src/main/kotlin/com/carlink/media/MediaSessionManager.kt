@@ -1,15 +1,12 @@
 package com.carlink.media
 
-import android.app.PendingIntent
 import android.content.Context
-import android.content.Intent
 import android.graphics.BitmapFactory
 import android.support.v4.media.MediaMetadataCompat
 import android.support.v4.media.session.MediaSessionCompat
 import android.support.v4.media.session.PlaybackStateCompat
 import android.util.Log
 import com.carlink.BuildConfig
-import com.carlink.MainActivity
 import com.carlink.util.LogCallback
 
 private const val TAG = "CARLINK_MEDIA"
@@ -65,18 +62,6 @@ class MediaSessionManager(
     private var isPlaying: Boolean = false
     private var currentPosition: Long = 0L
 
-    // Dedup: last values pushed to MediaSession
-    private var lastPushedPlaying: Boolean? = null
-    private var lastPushedPositionMs: Long = 0L
-    private var lastPushedTimeNanos: Long = 0L
-
-    /** Position must drift more than this from AAOS-extrapolated value to trigger a push (seek). */
-    private val seekThresholdMs: Long = 2_000L
-
-    // Album art bitmap cache — avoids redundant BitmapFactory.decodeByteArray on same cover
-    private var cachedAlbumArtHash: Int = 0
-    private var cachedBitmap: android.graphics.Bitmap? = null
-
     // Lock for thread-safe MediaSession access (USB thread + main thread)
     private val sessionLock = Any()
 
@@ -112,20 +97,6 @@ class MediaSessionManager(
                     // Set callback for handling media button events
                     setCallback(mediaSessionCallback)
 
-                    // Link MediaSession to our Activity so AAOS treats the media
-                    // controls and the app UI as a single unit. Without this, newer
-                    // AAOS firmware demotes the app to a background media source.
-                    setSessionActivity(
-                        PendingIntent.getActivity(
-                            context,
-                            0,
-                            Intent(context, MainActivity::class.java).apply {
-                                flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
-                            },
-                            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-                        ),
-                    )
-
                     // Set supported actions
                     setPlaybackState(buildPlaybackState(PlaybackStateCompat.STATE_NONE))
 
@@ -149,79 +120,23 @@ class MediaSessionManager(
     }
 
     /**
-     * Refresh the MediaSession to force AAOS to re-read metadata.
-     *
-     * GM AAOS occasionally stops updating the now-playing display from an existing
-     * MediaSession. This deactivates the session (AAOS sees it disappear), clears
-     * all internal state and metadata, then reactivates it (AAOS re-reads everything).
-     *
-     * We keep the same session instance (same token) because
-     * MediaBrowserServiceCompat.setSessionToken() throws on a second call —
-     * a new session with a new token can't be pushed to the running service.
-     *
-     * The caller should re-push metadata and playback state after calling this.
-     */
-    fun refresh() {
-        synchronized(sessionLock) {
-            val session = mediaSession
-            if (session == null) {
-                log("[MEDIA_SESSION] Refresh requested but session is null — skipping")
-                return
-            }
-
-            log("[MEDIA_SESSION] Refresh requested — deactivating and clearing session")
-
-            try {
-                // Deactivate so AAOS sees the session disappear
-                session.isActive = false
-
-                // Clear metadata — forces AAOS to discard cached state
-                session.setMetadata(
-                    MediaMetadataCompat.Builder()
-                        .putString(MediaMetadataCompat.METADATA_KEY_TITLE, "")
-                        .build(),
-                )
-                session.setPlaybackState(buildPlaybackState(PlaybackStateCompat.STATE_NONE))
-
-                // Invalidate all dedup state so subsequent metadata/playback pushes
-                // go through unconditionally
-                cachedAlbumArtHash = 0
-                cachedBitmap = null
-                lastPushedPlaying = null
-                lastPushedPositionMs = 0L
-                lastPushedTimeNanos = 0L
-
-                // Reactivate — AAOS re-binds and reads fresh metadata
-                session.isActive = true
-
-                log("[MEDIA_SESSION] Refresh complete — session reactivated")
-            } catch (e: Exception) {
-                log("[MEDIA_SESSION] Error during refresh: ${e.message}")
-            }
-        }
-    }
-
-    /**
      * Release the MediaSession.
      *
      * Call this during plugin detachment.
      */
     fun release() {
-        try {
-            mediaSession?.let { session ->
-                session.isActive = false
-                session.release()
+        synchronized(sessionLock) {
+            try {
+                mediaSession?.let { session ->
+                    session.isActive = false
+                    session.release()
+                }
+                mediaSession = null
+                mediaControlCallback = null
+                log("[MEDIA_SESSION] Released")
+            } catch (e: Exception) {
+                log("[MEDIA_SESSION] Error during release: ${e.message}")
             }
-            mediaSession = null
-            mediaControlCallback = null
-            cachedAlbumArtHash = 0
-            cachedBitmap = null
-            lastPushedPlaying = null
-            lastPushedPositionMs = 0L
-            lastPushedTimeNanos = 0L
-            log("[MEDIA_SESSION] Released")
-        } catch (e: Exception) {
-            log("[MEDIA_SESSION] Error during release: ${e.message}")
         }
     }
 
@@ -235,7 +150,7 @@ class MediaSessionManager(
     /**
      * Get the MediaSession token for use with MediaBrowserService.
      */
-    fun getSessionToken(): MediaSessionCompat.Token? = mediaSession?.sessionToken
+    fun getSessionToken(): MediaSessionCompat.Token? = synchronized(sessionLock) { mediaSession?.sessionToken }
 
     /**
      * Update now-playing metadata from CarPlay/AA projection.
@@ -281,19 +196,10 @@ class MediaSessionManager(
                     builder.putLong(MediaMetadataCompat.METADATA_KEY_DURATION, duration)
                 }
 
-                // Decode and add album art with caching to avoid redundant decodes
+                // Decode and add album art, or clear if null/failed
                 if (albumArt != null) {
                     try {
-                        val hash = albumArt.contentHashCode()
-                        val bitmap =
-                            if (hash == cachedAlbumArtHash && cachedBitmap != null) {
-                                cachedBitmap
-                            } else {
-                                BitmapFactory.decodeByteArray(albumArt, 0, albumArt.size)?.also {
-                                    cachedAlbumArtHash = hash
-                                    cachedBitmap = it
-                                }
-                            }
+                        val bitmap = BitmapFactory.decodeByteArray(albumArt, 0, albumArt.size)
                         if (bitmap != null) {
                             builder.putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, bitmap)
                             builder.putBitmap(MediaMetadataCompat.METADATA_KEY_DISPLAY_ICON, bitmap)
@@ -336,22 +242,6 @@ class MediaSessionManager(
             isPlaying = playing
             currentPosition = position
 
-            // Deduplicate: only push to MediaSession on actual state change or seek.
-            // AAOS extrapolates position from (position + speed * elapsed), so continuous
-            // position ticks during normal playback are redundant.
-            val stateChanged = playing != lastPushedPlaying
-            val now = System.nanoTime()
-            val elapsedMs = (now - lastPushedTimeNanos) / 1_000_000L
-            val expectedPosition =
-                if (lastPushedPlaying == true) {
-                    lastPushedPositionMs + elapsedMs
-                } else {
-                    lastPushedPositionMs
-                }
-            val seekDetected = kotlin.math.abs(position - expectedPosition) > seekThresholdMs
-
-            if (!stateChanged && !seekDetected) return
-
             val state =
                 if (playing) {
                     PlaybackStateCompat.STATE_PLAYING
@@ -361,11 +251,7 @@ class MediaSessionManager(
 
             try {
                 session.setPlaybackState(buildPlaybackState(state, position))
-                lastPushedPlaying = playing
-                lastPushedPositionMs = position
-                lastPushedTimeNanos = now
-                val reason = if (stateChanged) "state change" else "seek"
-                log("[MEDIA_SESSION] Playback state: ${if (playing) "PLAYING" else "PAUSED"} ($reason, pos=${position}ms)")
+                log("[MEDIA_SESSION] Playback state: ${if (playing) "PLAYING" else "PAUSED"}")
             } catch (e: Exception) {
                 log("[MEDIA_SESSION] Failed to update playback state: ${e.message}")
             }
@@ -381,25 +267,10 @@ class MediaSessionManager(
 
             isPlaying = false
             currentPosition = 0L
-            cachedAlbumArtHash = 0
-            cachedBitmap = null
-            lastPushedPlaying = null
-            lastPushedPositionMs = 0L
-            lastPushedTimeNanos = 0L
 
             try {
                 session.setPlaybackState(buildPlaybackState(PlaybackStateCompat.STATE_STOPPED))
-
-                // Clear metadata to prevent stale now-playing in cluster/system UI
-                session.setMetadata(
-                    MediaMetadataCompat
-                        .Builder()
-                        .putString(MediaMetadataCompat.METADATA_KEY_TITLE, "Carlink")
-                        .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, "Not connected")
-                        .build(),
-                )
-
-                log("[MEDIA_SESSION] Playback state: STOPPED, metadata cleared")
+                log("[MEDIA_SESSION] Playback state: STOPPED")
             } catch (e: Exception) {
                 log("[MEDIA_SESSION] Failed to set stopped state: ${e.message}")
             }
@@ -447,15 +318,10 @@ class MediaSessionManager(
                 PlaybackStateCompat.ACTION_SKIP_TO_NEXT or
                 PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS
 
-        // Speed must be 0f when not playing — AAOS extrapolates position
-        // from (state + speed + position + timestamp), so 1.0f while paused
-        // causes the seek bar to drift in cluster and system media UI.
-        val speed = if (state == PlaybackStateCompat.STATE_PLAYING) 1.0f else 0f
-
         return PlaybackStateCompat
             .Builder()
             .setActions(actions)
-            .setState(state, position, speed)
+            .setState(state, position, 1.0f)
             .build()
     }
 

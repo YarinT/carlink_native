@@ -1,12 +1,10 @@
 package com.carlink.protocol
 
-import com.carlink.protocol.MultiTouchAction
 import com.carlink.usb.UsbDeviceWrapper
 import java.util.Locale
 import java.util.Timer
 import java.util.TimerTask
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -17,6 +15,8 @@ import java.util.concurrent.atomic.AtomicLong
  * - Heartbeat keepalive
  * - Message sending and receiving
  * - Performance tracking
+ *
+ * Ported from: lib/driver/adaptr_driver.dart
  */
 class AdapterDriver(
     private val usbDevice: UsbDeviceWrapper,
@@ -28,22 +28,20 @@ class AdapterDriver(
     private val videoProcessor: UsbDeviceWrapper.VideoDataProcessor? = null,
 ) {
     private var heartbeatTimer: Timer? = null
-    private var wifiConnectTimer: Timer? = null
     private val heartbeatInterval = 2000L // 2 seconds
 
     private val isRunning = AtomicBoolean(false)
 
-    // Performance tracking — atomic because send() is called from multiple
-    // threads (heartbeat timer, mic capture timer, main thread) and the
-    // reading loop callback runs on the USB read thread.
-    private val messagesSent = AtomicInteger(0)
-    private val messagesReceived = AtomicInteger(0)
-    private val bytesSent = AtomicLong(0)
-    private val bytesReceived = AtomicLong(0)
-    private val sendErrors = AtomicInteger(0)
-    private val receiveErrors = AtomicInteger(0)
-    private val heartbeatsSent = AtomicInteger(0)
+    // Performance tracking
+    private var messagesSent = 0
+    private var messagesReceived = 0
+    private var bytesSent = 0L
+    private var bytesReceived = 0L
+    private var sendErrors = 0
+    private var receiveErrors = 0
+    private var heartbeatsSent = 0
     private val sessionStart = AtomicLong(0)
+    private var lastHeartbeat: Long = 0
     private var initMessagesCount = 0
 
     /**
@@ -57,12 +55,10 @@ class AdapterDriver(
         config: AdapterConfig = AdapterConfig.DEFAULT,
         initMode: String = "FULL",
         pendingChanges: Set<String> = emptySet(),
-        surfaceWidth: Int = 0,
-        surfaceHeight: Int = 0,
-    ): Boolean {
+    ) {
         if (isRunning.getAndSet(true)) {
             log("Adapter already running")
-            return true
+            return
         }
 
         sessionStart.set(System.currentTimeMillis())
@@ -72,7 +68,7 @@ class AdapterDriver(
             log("USB device not opened")
             errorHandler("USB device not opened")
             isRunning.set(false)
-            return false
+            return
         }
 
         // Start heartbeat FIRST for firmware stabilization
@@ -80,45 +76,37 @@ class AdapterDriver(
         log("Heartbeat started before initialization (firmware stabilization)")
 
         // Send initialization sequence based on mode
-        val initMessages = MessageSerializer.generateInitSequence(config, initMode, pendingChanges, surfaceWidth, surfaceHeight)
+        val initMessages = MessageSerializer.generateInitSequence(config, initMode, pendingChanges)
         initMessagesCount = initMessages.size
-        var initFailures = 0
         log("Sending $initMessagesCount initialization messages (mode=$initMode, changes=$pendingChanges)")
 
         for ((index, message) in initMessages.withIndex()) {
             log("Init message ${index + 1}/$initMessagesCount")
             if (!send(message)) {
-                initFailures++
                 log("Failed to send init message ${index + 1}")
             }
             // Delay between messages to allow adapter firmware to process each one
             Thread.sleep(120)
         }
 
-        val allSent = initFailures == 0
-        log("Initialization sequence completed (${initMessagesCount - initFailures}/$initMessagesCount sent)")
+        log("Initialization sequence completed")
 
         // Schedule wifiConnect with timeout (matches pi-carplay behavior)
-        wifiConnectTimer =
-            Timer().apply {
-                schedule(
-                    object : TimerTask() {
-                        override fun run() {
-                            if (isRunning.get()) {
-                                log("Sending wifiConnect command (timeout-based)")
-                                send(MessageSerializer.serializeCommand(CommandMapping.WIFI_CONNECT))
-                            }
-                        }
-                    },
-                    600,
-                )
-            }
+        Timer().schedule(
+            object : TimerTask() {
+                override fun run() {
+                    if (isRunning.get()) {
+                        log("Sending wifiConnect command (timeout-based)")
+                        send(MessageSerializer.serializeCommand(CommandMapping.WIFI_CONNECT))
+                    }
+                }
+            },
+            600,
+        )
 
         // Start reading loop
         log("Starting message reading loop")
         startReadingLoop()
-
-        return allSent
     }
 
     /**
@@ -131,8 +119,6 @@ class AdapterDriver(
 
         log("Stopping adapter connection")
 
-        wifiConnectTimer?.cancel()
-        wifiConnectTimer = null
         stopHeartbeat()
         usbDevice.stopReadingLoop()
 
@@ -156,16 +142,16 @@ class AdapterDriver(
         return try {
             val result = usbDevice.write(data, writeTimeout)
             if (result == data.size) {
-                messagesSent.incrementAndGet()
-                bytesSent.addAndGet(data.size.toLong())
+                messagesSent++
+                bytesSent += data.size
                 true
             } else {
-                sendErrors.incrementAndGet()
+                sendErrors++
                 log("Send incomplete: $result/${data.size} bytes")
                 false
             }
         } catch (e: Exception) {
-            sendErrors.incrementAndGet()
+            sendErrors++
             log("Send error: ${e.message}")
             errorHandler(e.message ?: "Send error")
             false
@@ -181,22 +167,18 @@ class AdapterDriver(
     }
 
     /**
-     * Send a multi-touch event (CarPlay — type 0x17, 0..1 floats).
+     * Send a touch event.
      */
-    fun sendMultiTouch(touches: List<MessageSerializer.TouchPoint>): Boolean = send(MessageSerializer.serializeMultiTouch(touches))
+    fun sendTouch(
+        action: TouchAction,
+        x: Float,
+        y: Float,
+    ): Boolean = send(MessageSerializer.serializeTouch(action, x, y))
 
     /**
-     * Send a single-touch event (Android Auto — type 0x05, 0..10000 ints).
-     * @param encoderType Current video encoder type from video header flags
-     * @param offScreen Current off-screen state from video header flags
+     * Send a multi-touch event.
      */
-    fun sendSingleTouch(
-        x: Int,
-        y: Int,
-        action: MultiTouchAction,
-        encoderType: Int = 2,
-        offScreen: Int = 0,
-    ): Boolean = send(MessageSerializer.serializeSingleTouch(x, y, action, encoderType, offScreen))
+    fun sendMultiTouch(touches: List<MessageSerializer.TouchPoint>): Boolean = send(MessageSerializer.serializeMultiTouch(touches))
 
     /**
      * Send microphone audio data.
@@ -208,79 +190,37 @@ class AdapterDriver(
     ): Boolean = send(MessageSerializer.serializeAudio(data, decodeType, audioType))
 
     /**
-     * Send GNSS/NMEA data to the adapter for forwarding to the phone.
+     * Get performance statistics.
      */
-    fun sendGnssData(nmeaSentences: String): Boolean = send(MessageSerializer.serializeGnssData(nmeaSentences))
+    fun getPerformanceStats(): Map<String, Any> {
+        val sessionDuration =
+            if (sessionStart.get() > 0) {
+                (System.currentTimeMillis() - sessionStart.get()) / 1000
+            } else {
+                0L
+            }
+        val lastHeartbeatAge =
+            if (lastHeartbeat > 0) {
+                (System.currentTimeMillis() - lastHeartbeat) / 1000
+            } else {
+                0L
+            }
 
-    fun rebootAdapter(): Boolean {
-        log("[SEND] Reboot adapter (0xCD)")
-        return send(MessageSerializer.serializeRebootAdapter())
-    }
-
-    fun disconnectPhone(): Boolean {
-        log("[SEND] Disconnect phone (0x0F)")
-        return send(MessageSerializer.serializeDisconnectPhone())
-    }
-
-    fun closeDongle(): Boolean {
-        log("[SEND] Close dongle (0x15)")
-        return send(MessageSerializer.serializeCloseDongle())
-    }
-
-    /**
-     * Request the adapter to connect to a specific paired device by BT MAC address.
-     * Uses type 0x11 (AutoConnect_By_BluetoothAddress) H→A direction.
-     */
-    fun sendAutoConnectByBtAddress(btMac: String): Boolean {
-        log("[SEND] AutoConnect_By_BluetoothAddress: $btMac")
-        return send(MessageSerializer.serializeAutoConnectByBtAddress(btMac))
-    }
-
-    /**
-     * Request the adapter to forget/remove a device from its paired list.
-     * Moves the device from DevList to DeletedDevList, preventing auto-reconnect.
-     */
-    fun sendForgetBluetoothAddr(btMac: String): Boolean {
-        log("[SEND] ForgetBluetoothAddr: $btMac")
-        return send(MessageSerializer.serializeForgetBluetoothAddr(btMac))
-    }
-
-    /**
-     * Cancel the pending wifiConnect auto-connect timer and send a targeted
-     * AutoConnect_By_BluetoothAddress instead. Called when the user explicitly
-     * selects a device to connect to during a restart cycle.
-     */
-    fun overrideAutoConnectWithTarget(btMac: String): Boolean {
-        wifiConnectTimer?.cancel()
-        wifiConnectTimer = null
-        log("[SEND] Overriding auto-connect with targeted connect: $btMac")
-        return sendAutoConnectByBtAddress(btMac)
-    }
-
-    /**
-     * Request the adapter to send its current list of paired BT devices.
-     * Adapter responds with updated BoxSettings (0x19) containing DevList.
-     */
-    fun sendGetBtOnlineList(): Boolean {
-        log("[SEND] GetBluetoothOnlineList")
-        return sendCommand(CommandMapping.GET_BT_ONLINE_LIST)
-    }
-
-    /**
-     * Send graceful teardown sequence. Must be called BEFORE stop()
-     * since send() requires isRunning==true.
-     *
-     * Sequence (from pi-carplay USB captures):
-     * 1. DisconnectPhone (0x0F) — end phone's CarPlay/AA session
-     * 2. CloseDongle (0x15) — stop adapter internal processes
-     * 3. RebootAdapter (0xCD) — optional full adapter reboot
-     */
-    fun sendGracefulTeardown(reboot: Boolean = false) {
-        disconnectPhone()
-        closeDongle()
-        if (reboot) {
-            rebootAdapter()
-        }
+        return mapOf(
+            "sessionDurationSeconds" to sessionDuration,
+            "initMessagesCount" to initMessagesCount,
+            "messagesSent" to messagesSent,
+            "messagesReceived" to messagesReceived,
+            "bytesSent" to bytesSent,
+            "bytesReceived" to bytesReceived,
+            "sendErrors" to sendErrors,
+            "receiveErrors" to receiveErrors,
+            "heartbeatsSent" to heartbeatsSent,
+            "lastHeartbeatSecondsAgo" to lastHeartbeatAge,
+            "sendThroughputKBps" to if (sessionDuration > 0) bytesSent / sessionDuration / 1024.0 else 0.0,
+            "receiveThroughputKBps" to if (sessionDuration > 0) bytesReceived / sessionDuration / 1024.0 else 0.0,
+            "usbStats" to usbDevice.getPerformanceStats(),
+        )
     }
 
     // ==================== Private Methods ====================
@@ -293,18 +233,12 @@ class AdapterDriver(
                 scheduleAtFixedRate(
                     object : TimerTask() {
                         override fun run() {
-                            // Guard against unchecked exceptions killing the Timer thread.
-                            // java.util.Timer silently terminates on any exception from run(),
-                            // which would stop all heartbeats and cause adapter disconnect.
-                            try {
-                                if (isRunning.get()) {
-                                    heartbeatsSent.incrementAndGet()
-                                    if (!send(MessageSerializer.serializeHeartbeat())) {
-                                        log("Heartbeat send failed (count: $heartbeatsSent)")
-                                    }
+                            if (isRunning.get()) {
+                                lastHeartbeat = System.currentTimeMillis()
+                                heartbeatsSent++
+                                if (!send(MessageSerializer.serializeHeartbeat())) {
+                                    log("Heartbeat send failed (count: $heartbeatsSent)")
                                 }
-                            } catch (e: Exception) {
-                                android.util.Log.e("HeartbeatTimer", "Heartbeat exception: ${e.message}", e)
                             }
                         }
                     },
@@ -327,48 +261,41 @@ class AdapterDriver(
                 override fun onMessage(
                     type: Int,
                     data: ByteArray?,
-                    dataLength: Int,
                 ) {
-                    messagesReceived.incrementAndGet()
-                    bytesReceived.addAndGet((dataLength + HEADER_SIZE).toLong())
+                    messagesReceived++
+                    bytesReceived += (data?.size ?: 0) + HEADER_SIZE
 
-                    // For VIDEO_DATA with direct processing, data is null (processed directly by videoProcessor)
+                    // For VIDEO_DATA with direct processing, data is empty (processed directly by videoProcessor)
                     // Just signal the message handler that video is streaming
-                    if (type == MessageType.VIDEO_DATA.id &&
-                        videoProcessor != null && (data == null || dataLength == 0)
-                    ) {
+                    if (type == MessageType.VIDEO_DATA.id && videoProcessor != null && (data == null || data.isEmpty())) {
                         // Video data was processed directly by videoProcessor - just signal streaming
                         try {
                             messageHandler(VideoStreamingSignal)
                         } catch (e: Exception) {
-                            receiveErrors.incrementAndGet()
-                            val trace = e.stackTraceToString().take(500)
-                            log("VideoStreamingSignal handler error: ${e.message}\n$trace")
+                            receiveErrors++
+                            log("Message handler error: ${e.message}")
                         }
                         return
                     }
 
-                    val header = MessageHeader(dataLength, MessageType.fromId(type))
+                    val header = MessageHeader(data?.size ?: 0, MessageType.fromId(type))
                     val message = MessageParser.parseMessage(header, data)
 
                     // Log received message (except high-frequency types)
-                    if (type != MessageType.VIDEO_DATA.id && type != MessageType.AUDIO_DATA.id &&
-                        type != MessageType.NAVI_VIDEO_DATA.id && type != MessageType.HEARTBEAT_ECHO.id
-                    ) {
+                    if (type != MessageType.VIDEO_DATA.id && type != MessageType.AUDIO_DATA.id) {
                         log("[RECV] $message")
                     }
 
                     try {
                         messageHandler(message)
                     } catch (e: Exception) {
-                        receiveErrors.incrementAndGet()
-                        val trace = e.stackTraceToString().take(500)
-                        log("Message handler error for $message: ${e.message}\n$trace")
+                        receiveErrors++
+                        log("Message handler error: ${e.message}")
                     }
                 }
 
                 override fun onError(error: String) {
-                    receiveErrors.incrementAndGet()
+                    receiveErrors++
                     log("Reading loop error: $error")
                     errorHandler(error)
                 }
@@ -385,37 +312,36 @@ class AdapterDriver(
             } else {
                 0L
             }
-        val sent = bytesSent.get()
-        val received = bytesReceived.get()
         val sendThroughput =
             if (sessionDuration > 0) {
-                String.format(Locale.US, "%.1f", sent / sessionDuration / 1024.0)
+                String.format(Locale.US, "%.1f", bytesSent / sessionDuration / 1024.0)
             } else {
                 "0.0"
             }
         val receiveThroughput =
             if (sessionDuration > 0) {
-                String.format(Locale.US, "%.1f", received / sessionDuration / 1024.0)
+                String.format(Locale.US, "%.1f", bytesReceived / sessionDuration / 1024.0)
             } else {
                 "0.0"
             }
 
         log("Adapter Performance Summary:")
-        log("  Session: ${sessionDuration}s | Init: $initMessagesCount msgs | Heartbeats: ${heartbeatsSent.get()}")
-        log("  TX: ${messagesSent.get()} msgs / ${sent / 1024}KB / ${sendThroughput}KB/s")
-        log("  RX: ${messagesReceived.get()} msgs / ${received / 1024}KB / ${receiveThroughput}KB/s")
-        log("  Errors: TX=${sendErrors.get()} RX=${receiveErrors.get()}")
+        log("  Session: ${sessionDuration}s | Init: $initMessagesCount msgs | Heartbeats: $heartbeatsSent")
+        log("  TX: $messagesSent msgs / ${bytesSent / 1024}KB / ${sendThroughput}KB/s")
+        log("  RX: $messagesReceived msgs / ${bytesReceived / 1024}KB / ${receiveThroughput}KB/s")
+        log("  Errors: TX=$sendErrors RX=$receiveErrors")
     }
 
     private fun resetStats() {
-        messagesSent.set(0)
-        messagesReceived.set(0)
-        bytesSent.set(0)
-        bytesReceived.set(0)
-        sendErrors.set(0)
-        receiveErrors.set(0)
-        heartbeatsSent.set(0)
+        messagesSent = 0
+        messagesReceived = 0
+        bytesSent = 0
+        bytesReceived = 0
+        sendErrors = 0
+        receiveErrors = 0
+        heartbeatsSent = 0
         sessionStart.set(0)
+        lastHeartbeat = 0
         initMessagesCount = 0
     }
 

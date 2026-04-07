@@ -2,6 +2,7 @@ package com.carlink.ui.theme
 
 import android.app.Activity
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.material3.ColorScheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Typography
 import androidx.compose.material3.darkColorScheme
@@ -16,7 +17,20 @@ import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.unit.dp
 import androidx.core.view.WindowCompat
 
-/** Dark color scheme optimized for automotive (reduces glare, high contrast). */
+// Carlink Theme - Material 3 Design System
+//
+// Automotive-optimized theme with:
+// - Dark mode as default (reduces glare while driving)
+// - High contrast for readability
+// - Large touch targets for in-vehicle use
+//
+// Ported from: example/lib/theme.dart
+// Color scheme matches Flutter theme.dart exactly
+
+/**
+ * Dark color scheme (default for automotive).
+ * Matches Flutter theme.dart ColorScheme.dark() exactly.
+ */
 private val DarkColorScheme =
     darkColorScheme(
         // Primary colors - Dark teal/cyan based on #003E49
@@ -60,6 +74,7 @@ private val DarkColorScheme =
         inversePrimary = Color(0xFF006780),
     )
 
+// Light color scheme (not used in automotive, but kept for completeness)
 private val LightColorScheme =
     lightColorScheme(
         primary = Color(0xFF006780),
@@ -80,12 +95,6 @@ private val LightColorScheme =
         onErrorContainer = Color(0xFF410002),
         surface = Color(0xFFF5FAFB),
         onSurface = Color(0xFF171D1E),
-        // Surface container colors for cards and elevated surfaces (teal-tinted)
-        surfaceContainerLowest = Color(0xFFFFFFFF),
-        surfaceContainerLow = Color(0xFFEFF5F6),
-        surfaceContainer = Color(0xFFE9EFF0),
-        surfaceContainerHigh = Color(0xFFE3EAEB),
-        surfaceContainerHighest = Color(0xFFDDE4E6),
         surfaceVariant = Color(0xFFDBE4E6),
         onSurfaceVariant = Color(0xFF3F484A),
         outline = Color(0xFF6F797A),
@@ -96,10 +105,15 @@ private val LightColorScheme =
         inversePrimary = Color(0xFF5FD5ED),
     )
 
-/** Material 3 theme with automotive-optimized colors and typography. */
+/**
+ * Carlink Material 3 Theme
+ *
+ * @param darkTheme Force dark theme (default: true for automotive)
+ * @param dynamicColor Use dynamic colors from wallpaper (Android 12+)
+ */
 @Composable
 fun CarlinkTheme(
-    darkTheme: Boolean = isSystemInDarkTheme(), // Follow AAOS system theme
+    darkTheme: Boolean = true, // Default to dark for automotive
     dynamicColor: Boolean = false, // Disabled for consistent branding
     content: @Composable () -> Unit,
 ) {
@@ -139,6 +153,9 @@ fun CarlinkTheme(
     )
 }
 
+/**
+ * Custom typography for automotive readability
+ */
 val CarlinkTypography =
     Typography(
         // Large display for status text
@@ -158,9 +175,16 @@ val CarlinkTypography =
             ),
     )
 
+/**
+ * Standard button dimensions for automotive touch targets
+ */
 object AutomotiveDimens {
     val ButtonMinHeight = 72.dp
+    val ButtonMinWidth = 180.dp
     val ButtonPaddingHorizontal = 24.dp
     val ButtonPaddingVertical = 20.dp
     val IconSize = 28.dp
+    val SpacingSmall = 8.dp
+    val SpacingMedium = 16.dp
+    val SpacingLarge = 24.dp
 }

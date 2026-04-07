@@ -4,10 +4,8 @@ import android.content.Context
 import android.hardware.usb.UsbManager
 import android.os.PowerManager
 import android.view.Surface
-import androidx.core.content.edit
 import com.carlink.audio.DualStreamAudioManager
 import com.carlink.audio.MicrophoneCaptureManager
-import com.carlink.gnss.GnssForwarder
 import com.carlink.logging.Logger
 import com.carlink.logging.logDebug
 import com.carlink.logging.logError
@@ -16,38 +14,28 @@ import com.carlink.logging.logVideoUsb
 import com.carlink.logging.logWarn
 import com.carlink.media.CarlinkMediaBrowserService
 import com.carlink.media.MediaSessionManager
-import com.carlink.navigation.NavigationStateManager
 import com.carlink.platform.AudioConfig
 import com.carlink.platform.PlatformDetector
 import com.carlink.protocol.AdapterConfig
 import com.carlink.protocol.AdapterDriver
 import com.carlink.protocol.AudioCommand
 import com.carlink.protocol.AudioDataMessage
-import com.carlink.protocol.BluetoothPairedListMessage
-import com.carlink.protocol.BoxSettingsMessage
 import com.carlink.protocol.CommandMapping
 import com.carlink.protocol.CommandMessage
-import com.carlink.protocol.InfoMessage
 import com.carlink.protocol.MediaDataMessage
-import com.carlink.protocol.MediaType
 import com.carlink.protocol.Message
 import com.carlink.protocol.MessageSerializer
-import com.carlink.protocol.MultiTouchAction
-import com.carlink.protocol.NaviFocusMessage
-import com.carlink.protocol.PeerBluetoothAddressMessage
-import com.carlink.protocol.PhaseMessage
 import com.carlink.protocol.PhoneType
 import com.carlink.protocol.PluggedMessage
-import com.carlink.protocol.SessionTokenMessage
-import com.carlink.protocol.StatusValueMessage
-import com.carlink.protocol.AudioRoutingState
-import com.carlink.protocol.StreamPurpose
-import com.carlink.protocol.UnknownMessage
+import com.carlink.protocol.TouchAction
 import com.carlink.protocol.UnpluggedMessage
+import com.carlink.protocol.VideoDataMessage
+import com.carlink.protocol.PhaseMessage
 import com.carlink.protocol.VideoStreamingSignal
 import com.carlink.ui.settings.AdapterConfigPreference
 import com.carlink.ui.settings.MicSourceConfig
 import com.carlink.ui.settings.WiFiBandConfig
+import com.carlink.gnss.GnssForwarder
 import com.carlink.usb.UsbDeviceWrapper
 import com.carlink.util.AppExecutors
 import com.carlink.util.LogCallback
@@ -55,12 +43,9 @@ import com.carlink.video.H264Renderer
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import org.json.JSONObject
 import java.util.Timer
 import java.util.TimerTask
 import java.util.concurrent.atomic.AtomicReference
@@ -75,21 +60,39 @@ import java.util.concurrent.atomic.AtomicReference
  * - Audio playback via DualStreamAudioManager
  * - Microphone capture for Siri/calls
  * - MediaSession integration for AAOS
+ *
+ * Ported from: lib/carlink.dart
  */
 class CarlinkManager(
     private val context: Context,
     initialConfig: AdapterConfig = AdapterConfig.DEFAULT,
 ) {
-    init {
-        NavigationStateManager.initialize(context.applicationContext)
-    }
-
     // Config can be updated when actual surface dimensions are known
     private var config: AdapterConfig = initialConfig
+    private var lastSurfaceRebindMs = 0L
+    private var pendingStartUntilSurface = false
+    @Volatile private var videoPaused = false
+
+    // When true, perform a one-time decoder recovery the next time streaming starts.
+    private var needsPostStreamRecovery = false
+
+    // Prevent multiple recoveries in the same streaming session.
+    private var didPostStreamRecovery = false
+
+    // Guard against immediate double-reset (e.g., reset in start() then reset again on first STREAMING)
+    private var lastDecoderResetMs = 0L
+    
+    // Reusable discard buffer for paused video (prevents GC churn)
+    // 256KB reduces loop iterations on large packets without being "huge"
+    @Volatile private var discardVideoBuffer: ByteArray = ByteArray(256 * 1024)
 
     companion object {
         private const val USB_WAIT_PERIOD_MS = 3000L
         private const val PAIR_TIMEOUT_MS = 15000L
+
+        // Recovery constants (matches Flutter CarlinkPlugin.kt)
+        private const val RESET_THRESHOLD = 3
+        private const val RESET_WINDOW_MS = 30_000L
 
         // Auto-reconnect constants
         private const val MAX_RECONNECT_ATTEMPTS = 5
@@ -98,14 +101,6 @@ class CarlinkManager(
 
         // Surface debouncing - wait for size to stabilize before updating codec
         private const val SURFACE_DEBOUNCE_MS = 150L
-
-        // AA touch throttling interval (AutoKit uses 17ms / ~60fps)
-        private const val AA_TOUCH_THROTTLE_NS = 17_000_000L
-
-        // Pattern C: STREAMING sessions shorter than this are "short-lived" (unstable adapter)
-        private const val SHORT_SESSION_THRESHOLD_MS = 10_000L
-        // Pattern C: this many consecutive short sessions → "connection unstable"
-        private const val SHORT_SESSION_ESCALATION_COUNT = 2
     }
 
     /**
@@ -119,6 +114,23 @@ class CarlinkManager(
     }
 
     /**
+     * Information about a paired wireless device.
+     */
+    data class DeviceInfo(
+        val name: String,
+        val btMac: String,
+        val type: String = "Unknown",
+        val lastConnected: String? = null,
+    )
+
+    /**
+     * Callback for paired device list updates.
+     */
+    fun interface DeviceListener {
+        fun onDevicesChanged(devices: List<DeviceInfo>)
+    }
+
+    /**
      * Media metadata information.
      */
     data class MediaInfo(
@@ -127,20 +139,6 @@ class CarlinkManager(
         val albumName: String?,
         val appName: String?,
         val albumCover: ByteArray?,
-        val duration: Long,
-        val position: Long,
-        val isPlaying: Boolean,
-    )
-
-    /**
-     * Information about a paired device from the adapter's DevList.
-     */
-    data class DeviceInfo(
-        val btMac: String,
-        val name: String,
-        val type: String, // "CarPlay", "AndroidAuto", "HiCar"
-        val lastConnected: String? = null, // timestamp (CarPlay only)
-        val rfcomm: String? = null, // RFCOMM channel (CarPlay only)
     )
 
     /**
@@ -149,50 +147,12 @@ class CarlinkManager(
     interface Callback {
         fun onStateChanged(state: State)
 
-        fun onStatusTextChanged(text: String)
+        fun onMediaInfoChanged(mediaInfo: MediaInfo)
+
+        fun onLogMessage(message: String)
 
         fun onHostUIPressed()
-
-        /** Called when phone type becomes known (PLUGGED) or cleared (disconnect/error). */
-        fun onPhoneTypeChanged(phoneType: PhoneType) {}
-
-        /** Called when the adapter's paired device list changes. */
-        fun onDeviceListChanged(devices: List<DeviceInfo>) {}
     }
-
-    /**
-     * Listener for device management events (device list changes, connection state).
-     * Unlike [Callback], multiple listeners can be registered concurrently.
-     */
-    fun interface DeviceListener {
-        fun onDeviceListChanged(devices: List<DeviceInfo>)
-    }
-
-    private val deviceListeners = mutableListOf<DeviceListener>()
-
-    fun addDeviceListener(listener: DeviceListener) {
-        synchronized(deviceListeners) { deviceListeners.add(listener) }
-    }
-
-    fun removeDeviceListener(listener: DeviceListener) {
-        synchronized(deviceListeners) { deviceListeners.remove(listener) }
-    }
-
-    private fun notifyDeviceListeners() {
-        val snapshot = synchronized(deviceListeners) { deviceListeners.toList() }
-        snapshot.forEach { it.onDeviceListChanged(_deviceList) }
-    }
-
-    /**
-     * AA center-crop parameters for SurfaceView oversize/clip layout and touch remapping.
-     * Null when not applicable (CarPlay, 16:9 display, or no config yet).
-     */
-    data class AaCropParams(
-        val tierWidth: Int,
-        val tierHeight: Int,
-        val contentHeight: Int,
-        val cropTop: Int,
-    )
 
     // Coroutine scope for async operations
     private val scope = CoroutineScope(Dispatchers.Main)
@@ -200,21 +160,6 @@ class CarlinkManager(
     // Current state
     private val currentState = AtomicReference(State.DISCONNECTED)
     val state: State get() = currentState.get()
-
-    // Session-scoped unknown data counters — reset on connect, dumped on disconnect
-    private var unknownMessageTypeCount = 0
-    private var unknownMediaSubtypeCount = 0
-    private var unknownCommandCount = 0
-    private var unknownAudioCommandCount = 0
-    private var unknownPhoneTypeCount = 0
-    private var unknownBoxSettingsKeyCount = 0
-    private val unknownMessageTypes = mutableSetOf<Int>()     // raw type IDs seen
-    private val unknownMediaSubtypes = mutableSetOf<Int>()    // raw subtype IDs seen
-    private val unknownCommandIds = mutableSetOf<Int>()       // raw command IDs seen
-    private val unknownAudioCommandIds = mutableSetOf<Int>()  // raw audio cmd IDs seen
-
-    // Video frame logging throttle — log every 30th frame to reduce logcat spam
-    private var videoFrameCount = 0L
 
     // Callback
     private var callback: Callback? = null
@@ -238,24 +183,8 @@ class CarlinkManager(
     // Video
     private var h264Renderer: H264Renderer? = null
     private var videoSurface: Surface? = null
+    @Volatile private var videoInitialized = false // Track if video subsystem is ready for decoding
     private var lastVideoDiscardWarningTime = 0L // Throttle discard warnings
-
-    /** True once we've inferred phone type from video header (mid-session rejoin). */
-    private var videoPhoneTypeInferred = false
-
-    /** True when codec start is deferred until phone type is known (PLUGGED or video inference). */
-    private var codecDeferred = true
-
-    /** Actual video surface dimensions (may differ from config due to Compose inset behavior). */
-    private var actualSurfaceWidth = 0
-    private var actualSurfaceHeight = 0
-
-    // Video state from adapter header — tracked for AA touch flags (AutoKit packs these in touch payload)
-    // encoderType: 1=H264, 2=H265(default/initial), 4=MJPEG
-    // offScreen: 0=on-screen, 1=off-screen
-    @Volatile private var videoEncoderType = 2
-
-    @Volatile private var videoOffScreen = 0
 
     // Audio
     private var audioManager: DualStreamAudioManager? = null
@@ -266,69 +195,40 @@ class CarlinkManager(
     private var isMicrophoneCapturing = false
     private var currentMicDecodeType = 5 // 16kHz mono
     private var currentMicAudioType = 3 // Siri/voice input
-    private var lastIncomingDecodeType = 5 // Track adapter's current audio format (from incoming AudioData)
     private var micSendTimer: Timer? = null
-
-    /**
-     * Voice mode tracking for proper microphone lifecycle management.
-     *
-     * CRITICAL: CarPlay sends PHONECALL_START before SIRI_STOP when making calls via Siri.
-     * Without tracking, SIRI_STOP would kill the phone call's microphone.
-     *
-     * Observed sequence (from USB capture analysis):
-     *   217.13s: PHONECALL_START  → mic should stay active
-     *   217.26s: SIRI_STOP        → must NOT stop mic (phone call active)
-     */
-    private enum class VoiceMode { NONE, SIRI, PHONECALL }
-
-    private var activeVoiceMode = VoiceMode.NONE
-
-    // Audio routing state flags for two-factor PCM routing (replaces currentStreamPurpose)
-    @Volatile private var isSiriAudioActive = false
-    @Volatile private var isPhoneCallAudioActive = false
-    @Volatile private var isAlertAudioActive = false
-
-    // GNSS
-    private var gnssForwarder: GnssForwarder? = null
 
     // MediaSession
     private var mediaSessionManager: MediaSessionManager? = null
+
+    // GNSS forwarding
+    private var gnssForwarder: GnssForwarder? = null
 
     // Timers
     private var pairTimeout: Timer? = null
     private var frameIntervalJob: Job? = null
 
-    // Phone type tracking for keyframe request decisions
-    /** Current phone type (CarPlay, Android Auto, etc.) from the PLUGGED message. Null when no phone connected. */
-    @Volatile var currentPhoneType: PhoneType? = null
+    // Phone type tracking for frame interval decisions
+    var currentPhoneType: PhoneType? = null
         private set
+
+    // Wireless connection tracking (public for PhonesTab UI)
+    var connectedBtMac: String? = null
+    var currentWifi: Int? = null
+
+    // Paired device list (populated from BLUETOOTH_PAIRED_LIST messages)
+    @Volatile var pairedDevices: List<DeviceInfo> = emptyList()
+        private set
+
+    // Device listeners for UI updates
+    private val deviceListeners = mutableListOf<DeviceListener>()
+
+    // Recovery tracking (matches Flutter CarlinkPlugin.kt)
+    private var lastResetTime: Long = 0
+    private var consecutiveResets: Int = 0
 
     // Auto-reconnect on USB disconnect
     private var reconnectJob: Job? = null
     private var reconnectAttempts: Int = 0
-
-    // Status escalation: detect degraded adapter states and give actionable user feedback.
-    // - hadPriorSession: true if PLUGGED was received at least once since last user-initiated start().
-    //   Distinguishes "adapter broken after session died" from "normal waiting for first phone".
-    // - consecutiveNoResponse: counts sequential "no initial response" errors (Pattern A: USB write dead).
-    // - shortLivedStreamingCount: counts STREAMING sessions that die within SHORT_SESSION_THRESHOLD_MS
-    //   (Pattern C: unstable rapid cycling from ZLP or firmware issue).
-    // - lastStreamingStartMs: timestamp when STREAMING was entered, for short-session detection.
-    private var hadPriorSession: Boolean = false
-    private var consecutiveNoResponse: Int = 0
-    private var shortLivedStreamingCount: Int = 0
-    private var lastStreamingStartMs: Long = 0L
-
-    // Phase 13 (negotiation_failed) — prevents auto-restart loop when iPhone rejects config
-    private var negotiationRejected: Boolean = false
-
-    // Targeted connect: when set, the next restart() cycle sends AutoConnect_By_BtAddress
-    // instead of the normal WIFI_CONNECT (1002) auto-connect scan.
-    @Volatile private var pendingConnectTarget: String? = null
-
-    // Last targeted MAC — retained after pendingConnectTarget is consumed by start(),
-    // so PLUGGED handler can set _connectedBtMac even if PeerBluetoothAddress never arrives.
-    @Volatile private var lastConnectTargetMac: String? = null
 
     // Surface update debouncing - prevents repeated codec recreation during rapid surface size changes
     private var surfaceUpdateJob: Job? = null
@@ -343,23 +243,6 @@ class CarlinkManager(
     private var lastMediaAlbumName: String? = null
     private var lastMediaAppName: String? = null
     private var lastAlbumCover: ByteArray? = null
-    private var lastDuration: Long = 0L
-    private var lastPosition: Long = 0L
-    private var lastIsPlaying: Boolean = true
-
-    // Device identification and management
-    @Volatile private var _deviceList: List<DeviceInfo> = emptyList()
-    @Volatile private var _connectedBtMac: String? = null // from PeerBluetoothAddress or BoxSettings #2
-
-    /** The adapter's list of paired wireless devices (from BoxSettings DevList). */
-    val pairedDevices: List<DeviceInfo> get() = _deviceList
-
-    /** BT MAC of the currently connected phone (null if none). */
-    val connectedBtMac: String? get() = _connectedBtMac
-
-    /** WiFi status from PluggedMessage: 0=USB wired, 1=wireless, null=unknown. */
-    @Volatile var currentWifi: Int? = null
-        private set
 
     /** Clears cached media metadata to prevent stale data on reconnect. */
     private fun clearCachedMediaMetadata() {
@@ -368,40 +251,13 @@ class CarlinkManager(
         lastMediaAlbumName = null
         lastMediaAppName = null
         lastAlbumCover = null
-        lastDuration = 0L
-        lastPosition = 0L
-        lastIsPlaying = true
-        _connectedBtMac = null
-        currentWifi = null
-        NavigationStateManager.clear()
     }
 
     // Executors
     private val executors = AppExecutors()
 
-    // LogCallback for Java components — routes to Logger with proper tags
-    private val logCallback =
-        object : LogCallback {
-            override fun log(message: String) {
-                this@CarlinkManager.log(message)
-            }
-
-            override fun log(
-                tag: String,
-                message: String,
-            ) {
-                Logger.d(message, tag)
-            }
-
-            override fun logPerf(
-                tag: String,
-                message: String,
-            ) {
-                if (Logger.isDebugLoggingEnabled() && Logger.isTagEnabled(tag)) {
-                    Logger.d(message, tag)
-                }
-            }
-        }
+    // LogCallback for Java components
+    private val logCallback = LogCallback { message -> log(message) }
 
     /**
      * Initialize the manager with a Surface and actual surface dimensions.
@@ -424,93 +280,60 @@ class CarlinkManager(
         val evenWidth = surfaceWidth and 1.inv()
         val evenHeight = surfaceHeight and 1.inv()
 
-        // Track actual surface dims for AA crop/touch calculations
-        val prevSurfaceWidth = actualSurfaceWidth
-        val prevSurfaceHeight = actualSurfaceHeight
-        actualSurfaceWidth = evenWidth
-        actualSurfaceHeight = evenHeight
-
-        // Config resolution was pre-computed from stable WindowMetrics in MainActivity.
-        // Do NOT override with surface dimensions — SurfaceView size oscillates during
-        // Compose layout (systemBars insets apply asynchronously on AAOS).
-        if (config.userSelectedResolution) {
+        // Update config with actual surface dimensions
+        // This ensures adapter is configured for the correct resolution based on actual layout
+        // (with or without system bar insets depending on immersive mode)
+        if (config.width != evenWidth || config.height != evenHeight) {
             logInfo(
-                "[RES] Using user-selected resolution ${config.width}x${config.height} " +
-                    "(surface: ${evenWidth}x$evenHeight)",
+                "[RES] Updating config from ${config.width}x${config.height} to ${evenWidth}x$evenHeight " +
+                    "(actual surface size)",
                 tag = Logger.Tags.VIDEO,
             )
-        } else {
-            logInfo(
-                "[RES] Using pre-computed resolution ${config.width}x${config.height} " +
-                    "(surface: ${evenWidth}x$evenHeight)",
-                tag = Logger.Tags.VIDEO,
-            )
+            config = config.copy(width = evenWidth, height = evenHeight)
         }
 
-        // LIFECYCLE FIX: If renderer exists, always update surface via setOutputSurface().
+        // LIFECYCLE FIX: If a renderer already exists, ALWAYS rebind the output surface immediately
+        // via MediaCodec.setOutputSurface() (invoked internally by resume()).
         //
-        // CRITICAL: Do NOT use reference equality (===) to check if Surface is "the same".
-        // After app goes to background, the Surface Java object may be the same reference,
-        // but the underlying native BufferQueue is DESTROYED and recreated.
-        // The codec will be rendering to a dead buffer → "BufferQueue has been abandoned" error.
+        // CRITICAL: Do NOT use reference equality (===) to determine whether a Surface is "the same".
+        // After the app is backgrounded or the system enters standby, the Java Surface object may
+        // appear unchanged, but the underlying native BufferQueue is DESTROYED and recreated.
+        // If the codec continues rendering to the old buffer, video output will stall or go black
+        // ("BufferQueue has been abandoned").
         //
-        // Solution: Always call setOutputSurface() when initialize() is called with an existing
-        // renderer. This ensures the codec always has a valid native surface.
+        // Correct behavior: Whenever initialize() is called with an existing renderer, immediately
+        // rebind the codec to the provided Surface. This guarantees the codec always renders to a
+        // valid native surface after pause/resume, standby, orientation changes, or surface recreation.
         // See: https://developer.android.com/reference/android/media/MediaCodec#setOutputSurface
         //
-        // DEBOUNCE FIX: Surface size changes rapidly during layout (996→960→965→969→992).
-        // Each change triggers codec recreation. Debounce to wait for size stabilization.
+        // NOTE ON RAPID SIZE CHANGES:
+        // During initial layout or UI transitions, the surface size may change rapidly
+        // (e.g., 996->960->965->969->992). To avoid excessive repeated rebind calls during this brief
+        // jitter window, a small throttle (e.g., ~120ms) may be applied around the resume()
+        // invocation.
+        //
+        // IMPORTANT:
+        // This is a THROTTLE, not a debounce. One immediate surface rebind must always occur.
+        // Surface rebinding is cheap and lifecycle-critical and MUST NOT be delayed, otherwise
+        // the codec may continue rendering into a destroyed BufferQueue, resulting in a black screen.
+
         if (h264Renderer != null) {
-            // Store pending values
-            pendingSurface = surface
-            pendingSurfaceWidth = evenWidth
-            pendingSurfaceHeight = evenHeight
-            pendingCallback = callback
-
-            // Cancel any pending update
             surfaceUpdateJob?.cancel()
+            this@CarlinkManager.callback = callback
+            this@CarlinkManager.videoSurface = surface
 
-            // Debounce: wait for surface size to stabilize before updating codec
-            surfaceUpdateJob =
-                scope.launch {
-                    delay(SURFACE_DEBOUNCE_MS)
+            // Unblock gate BEFORE rebind/resume (critical to accept first keyframe packets)
+            videoPaused = false
 
-                    // Use the latest pending values after debounce
-                    val finalSurface = pendingSurface ?: return@launch
-                    val finalCallback = pendingCallback ?: return@launch
-
-                    logInfo(
-                        "[LIFECYCLE] Surface stabilized at " +
-                            "${pendingSurfaceWidth}x$pendingSurfaceHeight - updating codec",
-                        tag = Logger.Tags.VIDEO,
-                    )
-
-                    this@CarlinkManager.callback = finalCallback
-                    this@CarlinkManager.videoSurface = finalSurface
-
-                    // If container dimensions changed during an AA session, resend
-                    // BoxSettings so the phone re-renders for the new content area.
-                    // prevSurfaceWidth/Height captured before actualSurface* was overwritten.
-                    val dimsChanged =
-                        prevSurfaceWidth > 0 && prevSurfaceHeight > 0 &&
-                            (prevSurfaceWidth != pendingSurfaceWidth || prevSurfaceHeight != pendingSurfaceHeight)
-                    if (dimsChanged && currentPhoneType == PhoneType.ANDROID_AUTO) {
-                        resendBoxSettings()
-                        // Notify UI so oversized surface recalculates for new crop params
-                        finalCallback.onPhoneTypeChanged(PhoneType.ANDROID_AUTO)
-                    }
-
-                    if (codecDeferred && currentPhoneType != null) {
-                        // AA resize complete — start codec with the new oversized surface
-                        startCodecIfDeferred()
-                    } else if (!codecDeferred) {
-                        // Resume with new surface - this calls setOutputSurface() internally
-                        h264Renderer?.resume(finalSurface)
-                    }
-                }
+            val now = android.os.SystemClock.uptimeMillis()
+            if (now - lastSurfaceRebindMs >= 120L) {
+                lastSurfaceRebindMs = now
+                h264Renderer?.setOutputSurface(surface)
+                h264Renderer?.resume()
+            }
             return
         }
-
+        
         // First-time initialization - create new renderer
         this.callback = callback
         this.videoSurface = surface
@@ -531,19 +354,16 @@ class CarlinkManager(
             tag = Logger.Tags.AUDIO,
         )
         logInfo(
-            "[PLATFORM] Using VideoDecoder: " +
-                "${platformInfo.hardwareH264DecoderName ?: "generic (createDecoderByType)"}" +
-                if (platformInfo.requiresIntelMediaCodecFixes()) {
-                    " [Intel VPU workaround enabled]"
-                } else {
-                    ""
-                },
+            "[PLATFORM] Using VideoDecoder: ${platformInfo.hardwareH264DecoderName ?: "generic (createDecoderByType)"}",
             tag = Logger.Tags.VIDEO,
         )
 
         // Initialize H264 renderer with Surface for direct HWC rendering
+        // Surface comes from SurfaceView - no GPU composition overhead
+        // Pass platform-detected codec name for optimal hardware decoder selection
         h264Renderer =
             H264Renderer(
+                context,
                 config.width,
                 config.height,
                 surface,
@@ -559,36 +379,46 @@ class CarlinkManager(
             adapterDriver?.sendCommand(CommandMapping.FRAME)
         }
 
-        // Set CSD extraction callback — persist SPS/PPS for future codec pre-warming
-        h264Renderer?.setCsdExtractedCallback { sps, spsLen, pps, ppsLen ->
-            val btMac = connectedBtMac ?: return@setCsdExtractedCallback
-            val cacheKey = "${btMac}_${config.width}x${config.height}"
-            val prefs = context.getSharedPreferences("carlink_csd_cache", Context.MODE_PRIVATE)
+        // Start the H264 renderer to initialize MediaCodec and begin decoding
+        // This MUST be called before processData() - MediaCodec requires start() before queueInputBuffer()
+        h264Renderer?.start()
 
-            val spsData = sps.copyOf(spsLen)
-            val ppsData = if (pps != null && ppsLen > 0) pps.copyOf(ppsLen) else ByteArray(0)
+        // Mark video as initialized - videoProcessor will now process frames instead of discarding
+        videoPaused = false
+        videoInitialized = true
 
-            prefs.edit {
-                putString("sps_$cacheKey", android.util.Base64.encodeToString(spsData, android.util.Base64.NO_WRAP))
-                putString("pps_$cacheKey", android.util.Base64.encodeToString(ppsData, android.util.Base64.NO_WRAP))
+        // If something requested start() before the surface existed, start now.
+        if (pendingStartUntilSurface) {
+            pendingStartUntilSurface = false
+            scope.launch {
+                delay(150) // small settle time for Surface/codec
+                try {
+                    start()
+                } catch (e: Exception) {
+                    logError("[START] Deferred start failed: ${e.message}", tag = Logger.Tags.USB)
+                }
             }
-
-            logInfo("[DEVICE] CSD cached for $cacheKey: SPS=${spsLen}B, PPS=${ppsLen}B", tag = Logger.Tags.VIDEO)
         }
 
-        // Defer codec start until phone type is known (PLUGGED message).
-        // For AA, the UI will resize the SurfaceView to tier AR first (oversized + clip),
-        // which triggers surface destruction/creation. Starting the codec AFTER the resize
-        // avoids the 60s black screen from losing the active decoder's IDR reference.
-        // For CarPlay, the codec starts immediately at PLUGGED since no resize is needed.
-        codecDeferred = true
+        // If we are already connected/streaming, request a keyframe now that decoder is ready.
+        if (state == State.DEVICE_CONNECTED || state == State.STREAMING) {
+            val sent1 = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
+            logInfo("[INIT] Keyframe request after initialize sent: $sent1", tag = Logger.Tags.VIDEO)
 
-        logInfo("Video subsystem initialized, codec deferred until phone type known", tag = Logger.Tags.VIDEO)
+            scope.launch {
+                delay(600)
+                if (state == State.DEVICE_CONNECTED || state == State.STREAMING) {
+                    val sent2 = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
+                    logInfo("[INIT] Second keyframe request after initialize sent: $sent2", tag = Logger.Tags.VIDEO)
+                }
+            }
+        }
+
+        logInfo("Video subsystem initialized and ready for decoding", tag = Logger.Tags.VIDEO)
 
         // Initialize audio manager with platform-specific config
         audioManager =
             DualStreamAudioManager(
-                context,
                 logCallback,
                 audioConfig,
             )
@@ -600,18 +430,8 @@ class CarlinkManager(
                 logCallback,
             )
 
-        // Initialize GNSS forwarder for GPS → adapter → CarPlay pipeline (only if enabled)
-        if (config.gpsForwarding) {
-            gnssForwarder =
-                GnssForwarder(
-                    context = context,
-                    sendGnssData = { adapterDriver?.sendGnssData(it) ?: false },
-                    logCallback = ::log,
-                )
-        }
-
         // Initialize MediaSession only for ADAPTER audio mode (not Bluetooth)
-        // In Bluetooth mode, audio goes through phone BT → car stereo directly,
+        // In Bluetooth mode, audio goes through phone BT -> car stereo directly,
         // so we don't want this app to appear as an active media source in AAOS.
         // This prevents the vehicle from switching audio source to the app when
         // the user opens or returns to it.
@@ -643,16 +463,19 @@ class CarlinkManager(
                         },
                     )
                 }
-            // Push session token to MediaBrowserService for AAOS cluster integration.
-            // Uses updateSessionToken() to also push to an already-running service instance,
-            // resolving the race where the system starts the service before this point.
-            mediaSessionManager?.getSessionToken()?.let {
-                CarlinkMediaBrowserService.updateSessionToken(it)
-            }
             logInfo("MediaSession initialized (ADAPTER audio mode)", tag = Logger.Tags.ADAPTR)
         } else {
             logInfo("MediaSession skipped (BLUETOOTH audio mode - audio via phone BT)", tag = Logger.Tags.ADAPTR)
         }
+
+        // Initialize GPS forwarder — relays vehicle position to CarPlay via iAP2 LocationInformation
+        gnssForwarder = GnssForwarder(
+            context = context,
+            sendGnssData = { nmea ->
+                adapterDriver?.send(MessageSerializer.serializeGnss(nmea)) ?: false
+            },
+            logCallback = { msg -> logInfo(msg, tag = Logger.Tags.GNSS) },
+        )
 
         logInfo("CarlinkManager initialized", tag = Logger.Tags.ADAPTR)
     }
@@ -661,35 +484,32 @@ class CarlinkManager(
      * Start connection to the adapter.
      */
     suspend fun start() {
-        // Guard: Ensure H264Renderer is initialized before starting connection
-        // This prevents video data from being discarded when app starts via MediaBrowserService
-        // before MainActivity/Surface is ready
+        // Hard guard: do not start streaming until the renderer exists.
+        // Starting early can discard SPS/PPS + first IDR and lead to a persistent black screen.
         if (h264Renderer == null) {
             logWarn(
-                "H264Renderer not initialized - Surface not ready. " +
-                    "Video will be discarded until initialize() is called with valid Surface.",
+                "[START] Renderer not initialized (Surface not ready). Deferring start until initialize() runs.",
                 tag = Logger.Tags.VIDEO,
             )
+            pendingStartUntilSurface = true
+            return
         }
+        pendingStartUntilSurface = false
 
-        // Stop any existing connection before entering CONNECTING state
-        // so that FGS started at CONNECTING isn't immediately stopped by stop()→DISCONNECTED
+        // New session attempt (often after vehicle sleep). Arm a one-time post-stream recovery.
+        needsPostStreamRecovery = true
+        didPostStreamRecovery = false
+
+        setState(State.CONNECTING)
+
+        // Stop any existing connection
         if (adapterDriver != null) {
             stop()
         }
 
-        setState(State.CONNECTING)
-        setStatusText("Searching for adapter...")
-        resetUnknownCounters()
-
-        // Reset video renderer (only if initialized and codec is active).
-        // When codecDeferred=true (fresh init or reconnect), skip reset — the codec
-        // will be started by startCodecIfDeferred() at PLUGGED time with the correct
-        // surface. Calling reset() here would prematurely start the codec before the
-        // surface has stabilized (Compose layout may destroy/recreate the SurfaceView).
-        if (!codecDeferred) {
-            h264Renderer?.reset()
-        }
+        // Reset video renderer (only if initialized)
+        h264Renderer?.reset()
+        lastDecoderResetMs = android.os.SystemClock.uptimeMillis()
 
         // Initialize audio
         if (!audioInitialized) {
@@ -705,23 +525,20 @@ class CarlinkManager(
         if (device == null) {
             logError("Failed to find Carlinkit device", tag = Logger.Tags.USB)
             setState(State.DISCONNECTED)
-            setStatusText("Adapter not found")
             return
         }
 
         log("Device found, opening")
         usbDevice = device
-        setStatusText("Adapter found — opening...")
 
         if (!device.openWithPermission()) {
             logError("Failed to open USB device", tag = Logger.Tags.USB)
             setState(State.DISCONNECTED)
-            setStatusText("USB permission denied")
             return
         }
 
-        // Create video processor for direct USB -> codec data flow
-        // This bypasses message parsing for zero-copy performance (DIRECT_HANDOFF)
+        // Create video processor for direct USB -> ring buffer data flow
+        // This bypasses message parsing for zero-copy performance (matches Flutter architecture)
         val videoProcessor = createVideoProcessor()
 
         // Create and start adapter driver
@@ -736,8 +553,7 @@ class CarlinkManager(
 
         // Determine initialization mode based on first-run state and pending changes
         val adapterConfigPref = AdapterConfigPreference.getInstance(context)
-        val currentVersionCode = context.packageManager.getPackageInfo(context.packageName, 0).longVersionCode
-        val initMode = adapterConfigPref.getInitializationMode(currentVersionCode)
+        val initMode = adapterConfigPref.getInitializationMode()
         val pendingChanges = adapterConfigPref.getPendingChangesSync()
 
         // Refresh user-configurable settings from preference store before starting
@@ -747,8 +563,7 @@ class CarlinkManager(
         val refreshedConfig =
             config.copy(
                 audioTransferMode = userConfig.audioTransferMode,
-                // Sample rate is hardcoded to 48kHz - not user configurable
-                sampleRate = 48000,
+                sampleRate = userConfig.sampleRate.hz,
                 micType =
                     when (userConfig.micSource) {
                         MicSourceConfig.APP -> "os"
@@ -760,47 +575,23 @@ class CarlinkManager(
                         WiFiBandConfig.BAND_24GHZ -> "24ghz"
                     },
                 callQuality = userConfig.callQuality.value,
-                fps = userConfig.fps.fps,
-                handDriveMode = userConfig.handDrive.value,
-                gpsForwarding = userConfig.gpsForwarding,
             )
         config = refreshedConfig // Update stored config for other uses
 
-        log("[INIT] Mode: ${adapterConfigPref.getInitializationInfo(currentVersionCode)}")
+        log("[INIT] Mode: ${adapterConfigPref.getInitializationInfo()}")
         log("[INIT] Audio mode: ${if (refreshedConfig.audioTransferMode) "BLUETOOTH" else "ADAPTER"}")
 
-        setStatusText("Initializing adapter...")
-        val initSuccess = adapterDriver?.start(refreshedConfig, initMode.name, pendingChanges, actualSurfaceWidth, actualSurfaceHeight) ?: false
+        adapterDriver?.start(refreshedConfig, initMode.name, pendingChanges)
 
-        // If a targeted connect was requested (user selected a specific device),
-        // override the adapter's wifiConnect auto-connect timer with the target MAC.
-        val targetMac = pendingConnectTarget
-        if (targetMac != null) {
-            pendingConnectTarget = null
-            logInfo("[DEVICE_MGMT] Overriding auto-connect with targeted connect: $targetMac", tag = Logger.Tags.ADAPTR)
-            adapterDriver?.overrideAutoConnectWithTarget(targetMac)
-            setStatusText("Connecting to device...")
-        } else {
-            setStatusText("Waiting for phone...")
-        }
-
-        // Mark first init completed, store version, and clear pending changes
-        // ONLY clear pending changes if all init messages were sent successfully —
-        // otherwise the changes will be retried on next connection attempt.
+        // Mark first init completed and clear pending changes after successful start
+        // This runs in a coroutine to handle the suspend functions
+        videoPaused = false
         CoroutineScope(Dispatchers.IO).launch {
-            if (initSuccess) {
-                if (initMode == AdapterConfigPreference.InitMode.FULL) {
-                    adapterConfigPref.markFirstInitCompleted()
-                }
-                adapterConfigPref.updateLastInitVersionCode(currentVersionCode)
-                if (pendingChanges.isNotEmpty()) {
-                    adapterConfigPref.clearPendingChanges()
-                }
-            } else {
-                logWarn(
-                    "[INIT] Init messages failed — pending changes preserved for retry",
-                    tag = Logger.Tags.ADAPTR,
-                )
+            if (initMode == AdapterConfigPreference.InitMode.FULL) {
+                adapterConfigPref.markFirstInitCompleted()
+            }
+            if (pendingChanges.isNotEmpty()) {
+                adapterConfigPref.clearPendingChanges()
             }
         }
 
@@ -823,37 +614,18 @@ class CarlinkManager(
      * Stop and disconnect.
      */
     fun stop(reboot: Boolean = false) {
-        logDebug("[LIFECYCLE] stop() called - clearing keyframe schedule and phoneType", tag = Logger.Tags.VIDEO)
+        logDebug("[LIFECYCLE] stop() called - clearing frame interval and phoneType", tag = Logger.Tags.VIDEO)
+        didPostStreamRecovery = false
         clearPairTimeout()
-        cancelDelayedKeyframe()
+        stopFrameInterval()
         cancelReconnect() // Cancel any pending auto-reconnect
-        negotiationRejected = false // Clear rejection flag for fresh connection
-        hadPriorSession = false // Reset escalation — user-initiated fresh start
-        consecutiveNoResponse = 0
-        shortLivedStreamingCount = 0
         currentPhoneType = null // Clear phone type on disconnect
-        currentWifi = null
-        videoPhoneTypeInferred = false
-        codecDeferred = true // Reset for next connection
-        videoEncoderType = 2 // Reset to H265/initial
-        videoOffScreen = 0
-        callback?.onPhoneTypeChanged(PhoneType.UNKNOWN)
         clearCachedMediaMetadata() // Clear stale metadata to prevent race conditions on reconnect
-        activeVoiceMode = VoiceMode.NONE // Reset voice mode on disconnect
-        isSiriAudioActive = false
-        isPhoneCallAudioActive = false
-        isAlertAudioActive = false // Reset purpose on disconnect
         stopMicrophoneCapture()
 
-        // Stop GPS forwarding before stopping adapter (only if forwarder was created)
-        if (gnssForwarder != null) {
-            adapterDriver?.sendCommand(CommandMapping.STOP_GNSS_REPORT)
-            gnssForwarder?.stop()
-        }
-
-        // Graceful teardown: notify adapter before killing connection.
-        // Must happen before adapterDriver?.stop() (send() checks isRunning).
-        adapterDriver?.sendGracefulTeardown(reboot = reboot)
+        // Stop GPS forwarding before closing the USB connection
+        gnssForwarder?.stop()
+        adapterDriver?.sendCommand(CommandMapping.STOP_GNSS_REPORT)
 
         adapterDriver?.stop()
         adapterDriver = null
@@ -868,183 +640,41 @@ class CarlinkManager(
             logInfo("Audio released on stop", tag = Logger.Tags.AUDIO)
         }
 
-        dumpUnknownSummary()
         setState(State.DISCONNECTED)
     }
 
     /**
-     * Disconnect the phone's CarPlay/AA session without stopping the adapter.
-     * Sends protocol command 0x0F (DISCONNECT_PHONE) only.
-     */
-    fun disconnectPhone() {
-        logInfo("[LIFECYCLE] disconnectPhone() — sending 0x0F to end phone session")
-        scope.launch(Dispatchers.IO) {
-            adapterDriver?.disconnectPhone()
-        }
-    }
-
-    // ==================== Device Management ====================
-
-    /**
-     * Request the adapter to send a fresh list of paired devices.
-     * The adapter responds with BoxSettings (0x19) containing an updated DevList.
-     * The UI is notified via [Callback.onDeviceListChanged].
-     */
-    fun refreshDeviceList() {
-        logInfo("[DEVICE_MGMT] Requesting fresh device list", tag = Logger.Tags.ADAPTR)
-        scope.launch(Dispatchers.IO) {
-            adapterDriver?.sendGetBtOnlineList()
-        }
-    }
-
-    /**
-     * Connect to a specific paired device by BT MAC address.
-     *
-     * If currently streaming, disconnects the active phone first and waits for
-     * the UNPLUGGED → restart cycle before sending the targeted connect.
-     * If idle, sends the connect request immediately.
-     *
-     * @param btMac Target device BT MAC (format: "XX:XX:XX:XX:XX:XX")
-     */
-    fun connectToDevice(btMac: String) {
-        logInfo("[DEVICE_MGMT] Connect to device: $btMac (current state=$state, wifi=$currentWifi)", tag = Logger.Tags.ADAPTR)
-
-        // Set the pending target BEFORE disconnecting so the UNPLUGGED → restart cycle
-        // sends AutoConnect_By_BtAddress instead of WIFI_CONNECT (1002).
-        pendingConnectTarget = btMac
-        lastConnectTargetMac = btMac
-
-        scope.launch(Dispatchers.IO) {
-            if (state == State.STREAMING || state == State.DEVICE_CONNECTED) {
-                logInfo("[DEVICE_MGMT] Disconnecting current phone before targeted connect to $btMac", tag = Logger.Tags.ADAPTR)
-                adapterDriver?.disconnectPhone()
-                // UNPLUGGED handler will call restart() which checks pendingConnectTarget
-            } else {
-                // Not currently connected — send targeted connect directly
-                val sent = adapterDriver?.sendAutoConnectByBtAddress(btMac) ?: false
-                logInfo("[DEVICE_MGMT] AutoConnect_By_BtAddress($btMac) sent=$sent (direct, no active session)", tag = Logger.Tags.ADAPTR)
-                pendingConnectTarget = null
-            }
-        }
-    }
-
-    /**
-     * Remove a device from the adapter's paired list (DevList → DeletedDevList).
-     * The adapter will no longer auto-connect to this device.
-     * Refreshes the device list after removal.
-     *
-     * @param btMac Target device BT MAC (format: "XX:XX:XX:XX:XX:XX")
-     */
-    fun forgetDevice(btMac: String) {
-        logInfo("[DEVICE_MGMT] Forget device: $btMac (list size=${_deviceList.size})", tag = Logger.Tags.ADAPTR)
-
-        // Optimistically remove from local list immediately for responsive UI.
-        // The adapter may take 10-20s to process and confirm via GET_BT_ONLINE_LIST.
-        _deviceList = _deviceList.filter { it.btMac != btMac }
-        callback?.onDeviceListChanged(_deviceList)
-        notifyDeviceListeners()
-
-        scope.launch(Dispatchers.IO) {
-            val sent = adapterDriver?.sendForgetBluetoothAddr(btMac) ?: false
-            logInfo("[DEVICE_MGMT] ForgetBluetoothAddr($btMac) sent=$sent", tag = Logger.Tags.ADAPTR)
-            // Refresh list from adapter to confirm removal (adapter response may be slow)
-            delay(1000)
-            adapterDriver?.sendGetBtOnlineList()
-        }
-    }
-
-    /**
      * Restart the connection.
-     * Uses Dispatchers.IO for stop()/start() — both do blocking USB I/O
-     * (bulkTransfer, thread joins) that must never run on the main thread.
      */
     suspend fun restart() {
-        setStatusText("Restarting...")
-        withContext(Dispatchers.IO) { stop() }
-        delay(2000)
-        withContext(Dispatchers.IO) { start() }
+        stop()
+        kotlinx.coroutines.delay(2000)
+        start()
     }
 
     /**
      * Send a key command.
      */
-    private fun sendKey(command: CommandMapping): Boolean = adapterDriver?.sendCommand(command) ?: false
-
-    // AA touch throttling: AutoKit throttles MOVE events to 17ms (~60fps) intervals.
-    // This reduces USB traffic without perceptible input lag.
-    @Volatile private var lastAaTouchSendTimeNs = 0L
+    fun sendKey(command: CommandMapping): Boolean = adapterDriver?.sendCommand(command) ?: false
 
     /**
-     * Send a multi-touch event (CarPlay) or single-touch event (Android Auto).
-     * AA uses type 0x05 with 0..10000 ints; CarPlay uses type 0x17 with 0..1 floats.
-     * Dispatched to IO — USB bulkTransfer must never block the UI thread.
-     *
-     * AA MOVE events are throttled to 17ms intervals (matching AutoKit behavior).
-     * DOWN and UP are always sent immediately.
+     * Send a touch event.
      */
-    fun sendMultiTouch(touches: List<MessageSerializer.TouchPoint>) {
-        val driver = adapterDriver ?: return
-        val isAA = currentPhoneType == PhoneType.ANDROID_AUTO
-        scope.launch(Dispatchers.IO) {
-            if (isAA && touches.isNotEmpty()) {
-                // AA: send primary pointer as single-touch (type 0x05, 0..10000 ints)
-                val primary = touches.first()
-
-                // Throttle MOVE events to 17ms intervals (AutoKit compatibility)
-                if (primary.action == MultiTouchAction.MOVE) {
-                    val now = System.nanoTime()
-                    if (now - lastAaTouchSendTimeNs < AA_TOUCH_THROTTLE_NS) return@launch
-                    lastAaTouchSendTimeNs = now
-                }
-
-                val xi = (primary.x * 10000).toInt()
-                val yi = (primary.y * 10000).toInt()
-                if (BuildConfig.DEBUG) {
-                    logDebug(
-                        "[AA_TOUCH] type=0x05 action=${primary.action} x=$xi y=$yi" +
-                            " (norm=${primary.x},${primary.y})",
-                        tag = Logger.Tags.TOUCH,
-                    )
-                }
-                driver.sendSingleTouch(
-                    x = xi,
-                    y = yi,
-                    action = primary.action,
-                    encoderType = videoEncoderType,
-                    offScreen = videoOffScreen,
-                )
-            } else {
-                driver.sendMultiTouch(touches)
-            }
-        }
+    fun sendTouch(
+        action: TouchAction,
+        x: Float,
+        y: Float,
+    ): Boolean {
+        val normalizedX = x / config.width
+        val normalizedY = y / config.height
+        return adapterDriver?.sendTouch(action, normalizedX, normalizedY) ?: false
     }
 
-    fun rebootAdapter() {
-        logWarn("[LIFECYCLE] Reboot adapter requested", tag = Logger.Tags.ADAPTR)
-        cancelReconnect()
-        stopMicrophoneCapture()
-        adapterDriver?.rebootAdapter()
-        adapterDriver?.stop()
-        adapterDriver = null
-        usbDevice?.close()
-        usbDevice = null
-        if (audioInitialized) {
-            audioManager?.release()
-            audioInitialized = false
-        }
-        codecDeferred = true // Reset for next connection
-        currentPhoneType = null
-        currentWifi = null
-        pendingConnectTarget = null
-        lastConnectTargetMac = null
-        callback?.onPhoneTypeChanged(PhoneType.UNKNOWN)
-        activeVoiceMode = VoiceMode.NONE
-        isSiriAudioActive = false
-        isPhoneCallAudioActive = false
-        isAlertAudioActive = false
-        clearCachedMediaMetadata()
-        setState(State.DISCONNECTED)
-    }
+    /**
+     * Send a multi-touch event.
+     */
+    fun sendMultiTouch(touches: List<MessageSerializer.TouchPoint>): Boolean =
+        adapterDriver?.sendMultiTouch(touches) ?: false
 
     /**
      * Release all resources.
@@ -1061,19 +691,22 @@ class CarlinkManager(
         microphoneManager?.stop()
         microphoneManager = null
 
-        gnssForwarder?.stop()
-        gnssForwarder = null
-
         mediaSessionManager?.release()
-        CarlinkMediaBrowserService.mediaSessionToken = null
         mediaSessionManager = null
 
-        // Cancel coroutine scope to stop any in-flight coroutines that hold
-        // references to this manager and its context
-        scope.cancel()
+        gnssForwarder = null
 
         logInfo("CarlinkManager released", tag = Logger.Tags.ADAPTR)
     }
+
+    /**
+     * Get performance statistics.
+     */
+    fun getPerformanceStats(): Map<String, Any> =
+        buildMap {
+            put("state", state.name)
+            adapterDriver?.getPerformanceStats()?.let { putAll(it) }
+        }
 
     /**
      * Handle USB device detachment event.
@@ -1102,46 +735,33 @@ class CarlinkManager(
      * This operation resets the MediaCodec decoder without disconnecting the USB device.
      * Useful for recovering from video decoding errors or codec issues.
      *
+     * Matches Flutter: DeviceOperations.resetH264Renderer()
      */
     fun resetVideoDecoder() {
         logInfo("[DEVICE_OPS] Resetting H264 video decoder", tag = Logger.Tags.VIDEO)
         h264Renderer?.reset()
+        lastDecoderResetMs = android.os.SystemClock.uptimeMillis()
         logInfo("[DEVICE_OPS] H264 video decoder reset completed", tag = Logger.Tags.VIDEO)
-        // reset() already sends a keyframe request via keyframeCallback — no additional FRAME needed
+        // Ensure frame interval running after manual reset
+        ensureFrameIntervalRunning()
     }
 
     /**
-     * Refresh the MediaSession to force GM AAOS to re-read metadata.
+     * Stops the video decoder/renderer without stopping the USB connection.
      *
-     * GM AAOS occasionally stops updating the now-playing display from an existing
-     * MediaSession. This deactivates/reactivates the session (forces AAOS to re-bind)
-     * and re-pushes all cached metadata and playback state.
+     * IMPORTANT: Must be called BEFORE navigating away from the projection screen
+     * to prevent BufferQueue abandoned errors. The codec outputs frames to the
+     * SurfaceTexture, which is destroyed when the VideoSurface composable is disposed.
+     * If the codec is still running when the surface is destroyed, it causes
+     * "BufferQueue has been abandoned" errors.
+     *
+     * The video will automatically restart when the user returns to the MainScreen
+     * and a new SurfaceTexture becomes available (via LaunchedEffect).
      */
-    fun refreshMediaSession() {
-        val manager = mediaSessionManager
-        if (manager == null) {
-            logWarn("[DEVICE_OPS] Cannot refresh MediaSession — not initialized (Bluetooth audio mode?)", tag = Logger.Tags.ADAPTR)
-            return
-        }
-
-        logInfo("[DEVICE_OPS] Refreshing MediaSession", tag = Logger.Tags.ADAPTR)
-
-        // Deactivate/reactivate session — invalidates dedup state internally
-        manager.refresh()
-
-        // Re-push all cached metadata to the fresh session
-        manager.updateMetadata(
-            title = lastMediaSongName,
-            artist = lastMediaArtistName,
-            album = lastMediaAlbumName,
-            appName = lastMediaAppName,
-            albumArt = lastAlbumCover,
-            duration = lastDuration,
-        )
-        manager.updatePlaybackState(playing = lastIsPlaying, position = lastPosition)
-        CarlinkMediaBrowserService.updateNowPlaying(lastMediaSongName, lastMediaArtistName)
-
-        logInfo("[DEVICE_OPS] MediaSession refresh completed", tag = Logger.Tags.ADAPTR)
+    fun stopVideo() {
+        logInfo("[VIDEO] Stopping video decoder before navigation", tag = Logger.Tags.VIDEO)
+        h264Renderer?.stop()
+        logInfo("[VIDEO] Video decoder stopped - safe to destroy surface", tag = Logger.Tags.VIDEO)
     }
 
     /**
@@ -1164,83 +784,19 @@ class CarlinkManager(
         // Clear surface reference - it's now invalid
         videoSurface = null
 
-        // Stop codec immediately - surface is dead
-        h264Renderer?.stop()
-    }
+        // Ensure that next initialize always passes throttling
+        lastSurfaceRebindMs = 0L
 
-    /**
-     * Start the codec if it was deferred. Called when:
-     * - PLUGGED(CarPlay): start immediately with current surface
-     * - AA surface resize complete: new surface available at tier AR
-     * - Video arrives before PLUGGED: fallback start with current surface
-     */
-    fun startCodecIfDeferred() {
-        if (!codecDeferred) return
-        val renderer = h264Renderer ?: return
-        // Use CarlinkManager.videoSurface (updated by debounce) — NOT renderer's
-        // internal surface, which may be null if surfaceDestroyed/Created happened
-        // during Compose layout after initialize() but before PLUGGED arrived.
-        val surface = videoSurface
-        if (surface == null || !surface.isValid) {
-            logWarn(
-                "[LIFECYCLE] Deferred codec start skipped — no valid surface",
-                tag = Logger.Tags.VIDEO,
-            )
-            return // Leave codecDeferred=true; debounce or resumeVideo() will retry
-        }
-        codecDeferred = false
-        logInfo("[LIFECYCLE] Starting deferred codec", tag = Logger.Tags.VIDEO)
-        renderer.resume(surface)
-    }
-
-    /**
-     * Compute AA center-crop parameters from the current adapter config.
-     * Returns null for CarPlay, 16:9 displays, or when config has no native dims.
-     * Uses config.width/height (video surface dims) to match serializeBoxSettings AR calc.
-     */
-    fun getAaCropParams(): AaCropParams? {
-        // Use actual surface dims (ground truth from Compose layout), not config dims
-        // (which come from WindowMetrics and may differ due to AAOS dock inset behavior).
-        val surfW = if (actualSurfaceWidth > 0) actualSurfaceWidth else config.width
-        val surfH = if (actualSurfaceHeight > 0) actualSurfaceHeight else config.height
-        if (surfW <= 0 || surfH <= 0) return null
-
-        val (tierWidth, tierHeight) =
-            when {
-                surfW >= 1920 -> Pair(1920, 1080)
-                surfW >= 1280 -> Pair(1280, 720)
-                else -> Pair(800, 480)
-            }
-        val displayAR = surfW.toFloat() / surfH.toFloat()
-        val contentHeight = ((tierWidth.toFloat() / displayAR).toInt() and 0xFFFE).coerceAtMost(tierHeight)
-        if (contentHeight >= tierHeight) return null // 16:9 or narrower — no crop needed
-        val cropTop = (tierHeight - contentHeight) / 2
-        return AaCropParams(tierWidth, tierHeight, contentHeight, cropTop)
-    }
-
-    /**
-     * Resend BoxSettings to the adapter with current surface dimensions.
-     * Called when display mode changes during an AA session so the phone
-     * re-renders content for the new container size.
-     */
-    fun resendBoxSettings() {
-        val driver = adapterDriver ?: return
-        val w = actualSurfaceWidth
-        val h = actualSurfaceHeight
-        if (w <= 0 || h <= 0) return
-        logInfo(
-            "[LIFECYCLE] Resending BoxSettings for new surface ${w}x$h",
-            tag = Logger.Tags.VIDEO,
-        )
-        val msg = MessageSerializer.serializeBoxSettings(config, surfaceWidth = w, surfaceHeight = h)
-        scope.launch(Dispatchers.IO) { driver.send(msg) }
+        // Pause codec immediately to prevent rendering to dead surface
+        h264Renderer?.pause()
+        videoPaused = true
     }
 
     /**
      * Pause video decoding when app goes to background.
      *
      * On AAOS, when the app is covered by another app (e.g., Maps, Phone), the Surface
-     * may remain valid but SurfaceFlinger stops consuming frames. This causes the
+     * may remain valid but SurfaceFlinger stops consuming frames. This causes
      * BufferQueue to fill up, stalling the decoder. When the user returns, video
      * appears blank while audio continues normally.
      *
@@ -1252,61 +808,109 @@ class CarlinkManager(
      *
      * Call this from Activity.onStop().
      */
-    fun pauseVideo() {
-        logInfo("[LIFECYCLE] Pausing video for background", tag = Logger.Tags.VIDEO)
-        h264Renderer?.stop()
-    }
-
-    /**
-     * Resume video decoding when app returns to foreground.
-     *
-     * After pauseVideo(), the codec is in a flushed state. This method restarts the
-     * codec and requests a keyframe so video can resume immediately.
-     *
-     * NOTE: The main surface update happens in initialize() when the new Surface is created.
-     * If onStart() is called before the Surface is ready, we skip resume here and let
-     * initialize() handle it when the Surface becomes available.
-     *
-     * Call this from Activity.onStart().
-     */
-    fun resumeVideo() {
-        logInfo("[LIFECYCLE] Resuming video for foreground", tag = Logger.Tags.VIDEO)
-
-        // If surface is null (destroyed and not yet recreated), skip resume.
-        // initialize() will handle resume when new Surface becomes available.
-        val surface = videoSurface
-        if (surface == null || !surface.isValid) {
-            logInfo(
-                "[LIFECYCLE] Surface not ready yet - resume will happen via initialize()",
-                tag = Logger.Tags.VIDEO,
-            )
-            return
+        fun pauseVideo() {
+            logInfo("[LIFECYCLE] Pausing video for background", tag = Logger.Tags.VIDEO)
+            h264Renderer?.pause()
+            videoPaused = true
         }
 
-        // Pass current surface to resume
-        h264Renderer?.resume(surface)
+    /**
+     * Resumes video decoding when the app returns to the foreground.
+     *
+     * Re-binds the output surface (critical after standby/suspend where native BufferQueue may be recreated),
+     * conditionally restarts the codec only if previously paused/flushed, clears any potential backlog defensively,
+     * and requests keyframes (immediate + delayed) to accelerate recovery and prevent black/grey screens.
+     *
+     * Call this from Activity.onStart() for proper lifecycle symmetry.
+     */
+        fun resumeVideo() {
+            logInfo("[LIFECYCLE] Resuming video for foreground", tag = Logger.Tags.VIDEO)
 
-        // Also request keyframe through adapter if connected
-        if (state == State.STREAMING || state == State.DEVICE_CONNECTED) {
-            adapterDriver?.sendCommand(CommandMapping.FRAME)
+            val surface = videoSurface
+            val surfaceValid = surface != null && surface.isValid
+
+            if (!surfaceValid) {
+                logInfo("[LIFECYCLE] Surface not ready or invalid - deferring full resume to initialize()", tag = Logger.Tags.VIDEO)
+                if (state == State.STREAMING || state == State.DEVICE_CONNECTED) {
+                    val sent = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
+                    logInfo("[RESUME] Early keyframe request sent (surface invalid): $sent", tag = Logger.Tags.VIDEO)
+                }
+                return
+            }
+
+            // Always rebind surface first
+            h264Renderer?.setOutputSurface(surface)
+
+            // Conditional resume + defensive clear
+            if (videoPaused) {
+                h264Renderer?.clearRingBuffer() // optional defensive
+                h264Renderer?.resume()
+                videoPaused = false  // Only clear after actual resume
+            } else {
+                logInfo("[RESUME] Not paused - skipping codec.start()", tag = Logger.Tags.VIDEO)
+            }
+
+            // Double keyframe request
+            if (state == State.STREAMING || state == State.DEVICE_CONNECTED) {
+                val sent1 = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
+                logInfo("[RESUME] First keyframe request sent: $sent1", tag = Logger.Tags.VIDEO)
+
+                scope.launch {
+                    delay(600)
+                    if (state == State.STREAMING || state == State.DEVICE_CONNECTED) {
+                        val sent2 = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
+                        logInfo("[RESUME] Delayed second keyframe request sent: $sent2", tag = Logger.Tags.VIDEO)
+                    }
+                }
+            }
         }
+
+    // ==================== Device Management (Wireless Phones) ====================
+
+    fun addDeviceListener(listener: DeviceListener) {
+        synchronized(deviceListeners) { deviceListeners.add(listener) }
     }
 
-    /**
-     * Recover video after settings overlay closes.
-     * Flushes the codec to release stalled BufferQueue buffers, then requests
-     * a keyframe (CarPlay only — AA keyframe resets phone UI).
-     */
-    fun recoverVideoFromOverlay() {
-        if (state != State.STREAMING) return
-        logInfo("[LIFECYCLE] Recovering video after overlay close (phoneType=$currentPhoneType)", tag = Logger.Tags.VIDEO)
-        h264Renderer?.flushCodec()
-        // Request one keyframe for both CarPlay and AA.
-        // Periodic FRAME commands reset AA phone UI, but a single recovery keyframe
-        // after overlay close is necessary — the user is already seeing a frozen frame.
-        // Waiting for a natural IDR (~60s) leaves the UI visually unresponsive.
-        val sent = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
-        logDebug("[LIFECYCLE] Post-overlay keyframe request sent=$sent", tag = Logger.Tags.VIDEO)
+    fun removeDeviceListener(listener: DeviceListener) {
+        synchronized(deviceListeners) { deviceListeners.remove(listener) }
+    }
+
+    /** Request a fresh paired-device list from the adapter. */
+    fun refreshDeviceList() {
+        adapterDriver?.sendCommand(CommandMapping.SCANNING_DEVICE)
+    }
+
+    /** Initiate a wireless connection to the device with the given BT MAC address. */
+    fun connectToDevice(btMac: String) {
+        logInfo("[PHONES] connectToDevice: $btMac", tag = Logger.Tags.ADAPTR)
+        adapterDriver?.sendCommand(CommandMapping.WIFI_CONNECT)
+    }
+
+    /** Disconnect the currently connected wireless phone. */
+    fun disconnectPhone() {
+        logInfo("[PHONES] disconnectPhone", tag = Logger.Tags.ADAPTR)
+        adapterDriver?.sendCommand(CommandMapping.BT_DISCONNECTED)
+        connectedBtMac = null
+    }
+
+    /** Send a reboot command to the adapter (used when settings require a hard restart). */
+    fun rebootAdapter() {
+        logInfo("[PHONES] rebootAdapter", tag = Logger.Tags.ADAPTR)
+        adapterDriver?.sendCommand(CommandMapping.WIFI_ENABLE)
+    }
+
+    /** Remove a device from the adapter's paired list. */
+    fun forgetDevice(btMac: String) {
+        logInfo("[PHONES] forgetDevice: $btMac", tag = Logger.Tags.ADAPTR)
+        // Remove from local list immediately for responsive UI
+        pairedDevices = pairedDevices.filter { it.btMac != btMac }
+        notifyDeviceListeners()
+    }
+
+    private fun notifyDeviceListeners() {
+        val snapshot = synchronized(deviceListeners) { deviceListeners.toList() }
+        val devices = pairedDevices
+        snapshot.forEach { it.onDevicesChanged(devices) }
     }
 
     // ==================== Private Methods ====================
@@ -1316,41 +920,35 @@ class CarlinkManager(
         if (oldState != newState) {
             callback?.onStateChanged(newState)
             updateMediaSessionState(newState)
-        }
-    }
 
-    private fun setStatusText(text: String) {
-        callback?.onStatusTextChanged(text)
+            if (newState == State.STREAMING) {
+                val sent = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
+                logInfo("[STATE] Immediate keyframe request on STREAMING state: $sent", tag = Logger.Tags.VIDEO)
+            }
+        }
     }
 
     private fun updateMediaSessionState(state: State) {
         when (state) {
             State.CONNECTING -> {
                 mediaSessionManager?.setStateConnecting()
-                // Start foreground service early to maintain process priority during handshake
-                CarlinkMediaBrowserService.startConnectionForeground(context)
-                // Acquire wake lock to ensure USB operations aren't interrupted
+                // Acquire wake lock early to ensure USB operations aren't interrupted
                 acquireWakeLock()
             }
 
             State.DISCONNECTED -> {
                 mediaSessionManager?.setStateStopped()
-                // Clear now-playing and stop foreground service
-                CarlinkMediaBrowserService.clearNowPlaying()
+                // Stop foreground service when disconnected
                 CarlinkMediaBrowserService.stopConnectionForeground(context)
                 // Release wake lock - CPU can sleep now
                 releaseWakeLock()
             }
 
             State.STREAMING -> {
-                // Defensive: ensure FGS is running (idempotent if already started at CONNECTING)
+                // Start foreground service to keep app active when backgrounded
                 CarlinkMediaBrowserService.startConnectionForeground(context)
                 // Ensure wake lock is held during streaming
                 acquireWakeLock()
-                // Start GPS forwarding to CarPlay (only if enabled in settings)
-                if (config.gpsForwarding) {
-                    gnssForwarder?.start()
-                }
             }
 
             else -> {} // Playback state updated when audio starts
@@ -1363,7 +961,7 @@ class CarlinkManager(
      */
     private fun acquireWakeLock() {
         if (!wakeLock.isHeld) {
-            wakeLock.acquire(2 * 60 * 60 * 1000L) // 2h safety timeout — released explicitly on DISCONNECTED
+            wakeLock.acquire(10 * 60 * 1000L) // 10 minute timeout as safety
             logInfo("[WAKE_LOCK] Acquired partial wake lock for USB streaming", tag = Logger.Tags.USB)
         }
     }
@@ -1387,7 +985,7 @@ class CarlinkManager(
 
             if (device == null) {
                 attempts++
-                delay(USB_WAIT_PERIOD_MS)
+                kotlinx.coroutines.delay(USB_WAIT_PERIOD_MS)
             }
         }
 
@@ -1398,125 +996,99 @@ class CarlinkManager(
         return device
     }
 
+    private fun maybeRunPostStreamRecovery() {
+        if (!needsPostStreamRecovery || didPostStreamRecovery) return
+
+        // Avoid immediate double-reset
+        val now = android.os.SystemClock.uptimeMillis()
+        if (now - lastDecoderResetMs < 1500L) {
+            logInfo("[RECOVERY] Skipping post-stream reset - decoder was reset recently", tag = Logger.Tags.VIDEO)
+            didPostStreamRecovery = true
+            needsPostStreamRecovery = false
+            return
+        }
+
+        didPostStreamRecovery = true
+        needsPostStreamRecovery = false
+
+        logWarn(
+            "[RECOVERY] Streaming started after reconnect - scheduling one-time decoder reset + keyframe burst",
+            tag = Logger.Tags.VIDEO,
+        )
+
+        scope.launch {
+            // Delay past MIN_STARTUP_TIME_MS (2000ms) so reset() actually executes
+            delay(2500)
+
+            resetVideoDecoder()  // Flush + start + keyframe request
+
+            delay(200)
+            val sent1 = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
+            logInfo("[RECOVERY] First keyframe request after reset sent: $sent1", tag = Logger.Tags.VIDEO)
+
+            delay(600)
+            val sent2 = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
+            logInfo("[RECOVERY] Second keyframe request after reset sent: $sent2", tag = Logger.Tags.VIDEO)
+        }
+    }
+
     private fun handleMessage(message: Message) {
         when (message) {
             is PluggedMessage -> {
-                // Store wifi status for UI (0=USB, 1=wireless)
-                currentWifi = message.wifi
-
                 logInfo(
                     "[PLUGGED] Device plugged: phoneType=${message.phoneType}, wifi=${message.wifi}",
                     tag = Logger.Tags.VIDEO,
                 )
-                if (message.phoneType == PhoneType.UNKNOWN) {
-                    unknownPhoneTypeCount++
-                    logWarn(
-                        "[PLUGGED] Unknown phoneType raw id=${message.rawPhoneType} " +
-                            "(0x${message.rawPhoneType.toString(16)})",
-                        tag = Logger.Tags.PROTO_UNKNOWN,
-                    )
-                }
                 clearPairTimeout()
-                cancelDelayedKeyframe() // Stop any existing timer (clean slate)
+                stopFrameInterval() // Stop any existing timer (clean slate)
 
-                // Reset reconnect attempts and escalation on successful connection
+                // Reset reconnect attempts on successful connection
                 reconnectAttempts = 0
-                consecutiveNoResponse = 0
-                shortLivedStreamingCount = 0
-                hadPriorSession = true
 
-                // Store phone type for keyframe request decisions during recovery
+                // Store phone type and wifi mode for frame interval decisions and UI
                 currentPhoneType = message.phoneType
-                logDebug("[PLUGGED] Stored currentPhoneType=$currentPhoneType", tag = Logger.Tags.VIDEO)
+                currentWifi = message.wifi
+                logDebug("[PLUGGED] Stored currentPhoneType=$currentPhoneType wifi=$currentWifi", tag = Logger.Tags.VIDEO)
 
-                // Infer connected BT MAC if not yet known (adapter may not send
-                // PeerBluetoothAddress or BoxSettings #2 in every session).
-                if (_connectedBtMac == null) {
-                    // Priority 1: user explicitly selected this device via connectToDevice()
-                    val targetMac = lastConnectTargetMac
-                    if (targetMac != null) {
-                        _connectedBtMac = targetMac
-                        lastConnectTargetMac = null
-                        logInfo("[PLUGGED] Set connectedBtMac=$targetMac from user-selected target", tag = Logger.Tags.ADAPTR)
-                    } else if (_deviceList.isNotEmpty()) {
-                        // Priority 2: match PLUGGED phoneType against DevList entries by type
-                        val typeMatch = when (message.phoneType) {
-                            PhoneType.CARPLAY, PhoneType.CARPLAY_WIRELESS -> "CarPlay"
-                            PhoneType.ANDROID_AUTO -> "AndroidAuto"
-                            PhoneType.HI_CAR -> "HiCar"
-                            else -> null
-                        }
-                        if (typeMatch != null) {
-                            val matched = _deviceList.filter { it.type == typeMatch }
-                            if (matched.size == 1) {
-                                _connectedBtMac = matched[0].btMac
-                                logInfo("[PLUGGED] Inferred connectedBtMac=${_connectedBtMac} from DevList (type=$typeMatch)", tag = Logger.Tags.ADAPTR)
-                            } else {
-                                logDebug("[PLUGGED] Cannot infer MAC: ${matched.size} devices match type=$typeMatch", tag = Logger.Tags.ADAPTR)
-                            }
-                        }
-                    }
+                // Plugged means a new session is forming. Don't reset yet; do recovery when streaming starts.
+                // If we are already streaming, do not re-arm recovery (avoid resetting a good stream).
+                if (state != State.STREAMING) {
+                    needsPostStreamRecovery = true
+                    didPostStreamRecovery = false
                 } else {
-                    // Already known — clear the target since connection succeeded
-                    lastConnectTargetMac = null
+                    logDebug("[PLUGGED] Already streaming - skipping post-stream recovery arm", tag = Logger.Tags.VIDEO)
                 }
 
-                // Enrich device list: if connected device has unknown type (came from
-                // BluetoothPairedList which doesn't carry type), update it from PLUGGED phoneType.
-                val connMac = _connectedBtMac
-                if (connMac != null) {
-                    val typeStr = when (message.phoneType) {
-                        PhoneType.CARPLAY, PhoneType.CARPLAY_WIRELESS -> "CarPlay"
-                        PhoneType.ANDROID_AUTO -> "AndroidAuto"
-                        PhoneType.HI_CAR -> "HiCar"
-                        else -> null
-                    }
-                    if (typeStr != null) {
-                        val device = _deviceList.find { it.btMac == connMac }
-                        if (device != null && device.type.isEmpty()) {
-                            _deviceList = _deviceList.map {
-                                if (it.btMac == connMac) it.copy(type = typeStr) else it
-                            }
-                            logInfo("[PLUGGED] Enriched device $connMac type → $typeStr", tag = Logger.Tags.ADAPTR)
-                            callback?.onDeviceListChanged(_deviceList)
-                            notifyDeviceListeners()
-                        }
-                    }
-                }
-
-                // Set AA mode on renderer for AA-specific behaviors:
-                // first-frame skip, frame cache replay, crop scaling mode
-                h264Renderer?.setAndroidAutoMode(message.phoneType == PhoneType.ANDROID_AUTO)
-
-                // For CarPlay: start codec now (no surface resize needed).
-                // For AA: onPhoneTypeChanged triggers UI resize → surfaceDestroyed/Created →
-                // debounce path calls startCodecIfDeferred() with the new oversized surface.
-                if (message.phoneType != PhoneType.ANDROID_AUTO) {
-                    startCodecIfDeferred()
-                }
-
-                callback?.onPhoneTypeChanged(message.phoneType)
-
-                // Enable GPS forwarding for CarPlay navigation (only if enabled in settings)
-                if (config.gpsForwarding) {
-                    adapterDriver?.sendCommand(CommandMapping.START_GNSS_REPORT)
-                }
+                // Start/ensure frame interval for CarPlay (periodic keyframe requests)
+                ensureFrameIntervalRunning()
 
                 setState(State.DEVICE_CONNECTED)
-                setStatusText("Phone connected — starting session...")
             }
 
             is UnpluggedMessage -> {
-                if (negotiationRejected) {
-                    logDebug(
-                        "[PHASE] Unplugged after negotiation rejection — not restarting",
-                        tag = Logger.Tags.ADAPTR,
-                    )
-                } else {
-                    setStatusText("Phone unplugged")
-                    scope.launch {
-                        restart()
-                    }
+                scope.launch {
+                    restart()
+                }
+            }
+
+            is VideoDataMessage -> {
+                clearPairTimeout()
+
+                if (state != State.STREAMING) {
+                    logInfo("Video streaming started", tag = Logger.Tags.VIDEO)
+                    setState(State.STREAMING)
+                    // Safety net: ensure frame interval running when video starts
+                    ensureFrameIntervalRunning()
+                    // Start GPS forwarding to adapter (CarPlay Maps vehicle position)
+                    gnssForwarder?.start()
+                    adapterDriver?.sendCommand(CommandMapping.START_GNSS_REPORT)
+                }
+
+                maybeRunPostStreamRecovery()
+
+                // Feed video data to renderer (fallback when direct processing not used)
+                message.data?.let { data ->
+                    h264Renderer?.processData(data, message.flags)
                 }
             }
 
@@ -1527,26 +1099,17 @@ class CarlinkManager(
 
                 if (state != State.STREAMING) {
                     logInfo("Video streaming started (direct processing)", tag = Logger.Tags.VIDEO)
-                    lastStreamingStartMs = System.currentTimeMillis()
                     setState(State.STREAMING)
-                    setStatusText("Streaming")
-
-                    if (currentPhoneType == PhoneType.ANDROID_AUTO) {
-                        // AA needs one keyframe request at session start to stabilize video.
-                        // Unlike CarPlay, AA must NOT receive periodic FRAME commands (resets phone UI).
-                        val sent = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
-                        logInfo("[FRAME_INTERVAL] AA one-shot keyframe request sent=$sent", tag = Logger.Tags.VIDEO)
-                    } else {
-                        // CarPlay: delayed keyframe request 2.5s after first video.
-                        // The adapter's natural SPS+PPS+IDR arrives at session start and decodes
-                        // immediately. This delayed request serves as a safety net for cold-start
-                        // decoder poisoning (observed on Intel hardware, first session only).
-                        // By 2.5s the codec is warm — a fresh IDR on a warm codec clears any
-                        // poisoned state. CarPlay encoder teardown is invisible to the user.
-                        scheduleDelayedKeyframe()
-                    }
+                    // Safety net: ensure frame interval running when video starts
+                    ensureFrameIntervalRunning()
+                    // Start GPS forwarding to adapter (CarPlay Maps vehicle position)
+                    gnssForwarder?.start()
+                    adapterDriver?.sendCommand(CommandMapping.START_GNSS_REPORT)
                 }
-                // Video data already processed directly by videoProcessor (DIRECT_HANDOFF)
+
+                maybeRunPostStreamRecovery()
+
+                // Video data already processed directly into ring buffer by videoProcessor
             }
 
             is AudioDataMessage -> {
@@ -1560,257 +1123,62 @@ class CarlinkManager(
             }
 
             is CommandMessage -> {
-                if (message.command == CommandMapping.REQUEST_HOST_UI) {
-                    callback?.onHostUIPressed()
-                } else if (message.command == CommandMapping.WIFI_DISCONNECTED) {
-                    // WiFi status notification - adapter's WiFi hotspot has no phone connected
-                    // This is informational only, NOT a session termination signal
-                    // Real disconnects come via UnpluggedMessage (0x04)
-                    logDebug("[WIFI] Adapter WiFi status: not connected", tag = Logger.Tags.ADAPTR)
-                } else if (message.command == CommandMapping.SCANNING_DEVICE) {
-                    if (hadPriorSession && reconnectAttempts > 0) {
-                        // Pattern B: adapter alive and scanning, but phone lost after a prior session.
-                        // Adapter's wireless subsystem may be stuck.
-                        setStatusText("Adapter scanning — phone not reconnecting")
-                        logWarn(
-                            "[ESCALATION] Pattern B: adapter scanning after prior session " +
-                                "(reconnect attempt $reconnectAttempts)",
-                            tag = Logger.Tags.ADAPTR,
-                        )
-                    } else {
-                        setStatusText("Scanning for phone...")
+                when (message.command) {
+                    CommandMapping.REQUEST_HOST_UI -> {
+                        callback?.onHostUIPressed()
                     }
-                    logDebug("[CMD] SCANNING_DEVICE", tag = Logger.Tags.ADAPTR)
-                } else if (message.command == CommandMapping.BT_CONNECTED ||
-                    message.command == CommandMapping.DEVICE_FOUND
-                ) {
-                    setStatusText("Phone found — connecting...")
-                    logDebug("[CMD] ${message.command.name}", tag = Logger.Tags.ADAPTR)
-                } else if (message.command == CommandMapping.INVALID) {
-                    unknownCommandCount++
-                    unknownCommandIds.add(message.rawId)
-                    logWarn(
-                        "[CMD] Unknown command id=${message.rawId} (0x${message.rawId.toString(16)})",
-                        tag = Logger.Tags.PROTO_UNKNOWN,
-                    )
-                } else {
-                    logDebug(
-                        "[CMD] ${message.command.name} (id=${message.rawId})",
-                        tag = Logger.Tags.ADAPTR,
-                    )
+                    CommandMapping.PROJECTION_DISCONNECTED -> {
+                        // Firmware binary analysis confirms: command 1010 (DeviceWifiNotConnected)
+                        // is triggered by WiFi state polling (fcn.00069d7c) — completely unrelated
+                        // to USB session state. Adapter continues operating normally after sending it.
+                        // Treating it as a disconnect caused spurious session drops on WiFi fluctuations.
+                        logInfo("[CMD] PROJECTION_DISCONNECTED(1010) — WiFi status only, ignoring", tag = Logger.Tags.ADAPTR)
+                    }
+                    CommandMapping.REQUEST_AUDIO_FOCUS,
+                    CommandMapping.REQUEST_AUDIO_FOCUS_TRANSIENT,
+                    CommandMapping.REQUEST_AUDIO_FOCUS_DUCK -> {
+                        // AAOS AudioManager handles audio focus natively via CarAudioContext.
+                        // Log for diagnostics; no explicit action needed from the app layer.
+                        logDebug("[CMD] Audio focus request: ${message.command}", tag = Logger.Tags.AUDIO)
+                    }
+                    CommandMapping.RELEASE_AUDIO_FOCUS -> {
+                        logDebug("[CMD] Audio focus released", tag = Logger.Tags.AUDIO)
+                    }
+                    CommandMapping.REQUEST_NAVI_FOCUS,
+                    CommandMapping.RELEASE_NAVI_FOCUS,
+                    CommandMapping.REQUEST_NAVI_SCREEN_FOCUS,
+                    CommandMapping.RELEASE_NAVI_SCREEN_FOCUS -> {
+                        logDebug("[CMD] Nav focus: ${message.command}", tag = Logger.Tags.NAVI)
+                    }
+                    else -> {
+                        logDebug("[CMD] Unhandled command: ${message.command}", tag = Logger.Tags.ADAPTR)
+                    }
                 }
             }
 
-            is BoxSettingsMessage -> {
-                if (message.isPhoneInfo) {
-                    // BoxSettings #2: phone connected — has MDModel, btMacAddr
-                    val phoneModel = message.json.optString("MDModel", "").ifEmpty { null }
-                    val btMac = message.json.optString("btMacAddr", "").ifEmpty { null }
-                    if (btMac != null) {
-                        _connectedBtMac = btMac
-                        tryPrestageCodecCsd(btMac)
-                    }
-                    // Phone link metadata (sent after phone connects)
-                    val linkType = message.json.optString("MDLinkType", "").ifEmpty { null }
-                    val osVersion = message.json.optString("MDOSVersion", "").ifEmpty { null }
-                    val linkVersion = message.json.optString("MDLinkVersion", "").ifEmpty { null }
-                    val cpuTemp = message.json.optInt("cpuTemp", -1).takeIf { it >= 0 }
-                    logInfo(
-                        "[DEVICE] Phone identified: model=$phoneModel, bt=$btMac" +
-                            (if (linkType != null) ", link=$linkType" else "") +
-                            (if (osVersion != null) ", os=$osVersion" else "") +
-                            (if (linkVersion != null) ", ver=$linkVersion" else "") +
-                            (if (cpuTemp != null) ", cpuTemp=${cpuTemp}°C" else ""),
-                        tag = Logger.Tags.ADAPTR,
-                    )
-                } else {
-                    // BoxSettings #1: adapter info — has DevList of previously paired devices
-                    _deviceList = parseDevList(message.json)
-                    callback?.onDeviceListChanged(_deviceList)
-                    notifyDeviceListeners()
-                    // Adapter capabilities
-                    val hiCar = message.json.optInt("HiCar", -1).takeIf { it >= 0 }
-                    val supportFeatures = message.json.optString("supportFeatures", "").ifEmpty { null }
-                    val channelList = message.json.optString("ChannelList", "").ifEmpty { null }
-                    logInfo(
-                        "[DEVICE] Paired devices: ${_deviceList.size}" +
-                            (if (hiCar != null) ", HiCar=$hiCar" else "") +
-                            (if (supportFeatures != null) ", features=$supportFeatures" else "") +
-                            (if (channelList != null) ", channels=$channelList" else ""),
-                        tag = Logger.Tags.ADAPTR,
-                    )
-                    _deviceList.forEachIndexed { idx, dev ->
-                        logDebug(
-                            "[DEVICE] DevList[$idx]: mac=${dev.btMac}, name=${dev.name}, " +
-                                "type=${dev.type}, last=${dev.lastConnected ?: "n/a"}",
-                            tag = Logger.Tags.ADAPTR,
-                        )
-                    }
-                    // Hot-rejoin: if exactly 1 paired device, try cache lookup now
-                    // (adapter may skip BoxSettings #2 and PeerBluetoothAddress)
-                    if (_deviceList.size == 1) {
-                        val mac = _deviceList[0].btMac
-                        _connectedBtMac = mac
-                        tryPrestageCodecCsd(mac)
-                    }
-                }
-
-                // Detect unknown JSON keys from adapter firmware updates
-                val knownKeys = setOf(
-                    "uuid", "MFD", "boxType", "OemName", "productType", "hwVersion",
-                    "supportLinkType", "WiFiChannel", "DevList", "ver", "mfd",
-                    "MDModel", "btMacAddr", "buildModel", "iOSVer", "linkType",
-                    "boxName", "wifiName", "btName", "oemIconLabel", "wifiPasswd",
-                    "androidWorkMode", "phoneMode", "DashboardInfo",
-                    "AndroidAutoSizeW", "AndroidAutoSizeH", "naviScreenInfo",
-                    "AdvancedFeatures", "GNSSCapability", "callQuality",
-                    "HiCar", "supportFeatures", "CusCode", "ChannelList",
-                    "MDLinkType", "MDOSVersion", "MDLinkVersion", "cpuTemp",
-                )
-                val unknownKeys = message.json.keys().asSequence()
-                    .filter { it !in knownKeys }
-                    .toList()
-                if (unknownKeys.isNotEmpty()) {
-                    unknownBoxSettingsKeyCount += unknownKeys.size
-                    val preview = unknownKeys.joinToString { key ->
-                        "$key=${message.json.opt(key)}"
-                    }
-                    logWarn(
-                        "[BOX_SETTINGS] Unknown keys: $preview",
-                        tag = Logger.Tags.PROTO_UNKNOWN,
-                    )
-                }
-            }
-
-            is PeerBluetoothAddressMessage -> {
-                _connectedBtMac = message.macAddress
-                logInfo("[DEVICE] Peer BT address: ${message.macAddress}", tag = Logger.Tags.ADAPTR)
-                tryPrestageCodecCsd(message.macAddress)
-            }
-
-            // Phase message — Phase 0 is a session termination signal (firmware kills AppleCarPlay)
             is PhaseMessage -> {
-                if (message.phase == 13) {
-                    logWarn(
-                        "[PHASE] Phase 13 (negotiation_failed) — Phone rejected configuration",
-                        tag = Logger.Tags.ADAPTR,
-                    )
-                    negotiationRejected = true
-                    setStatusText("Phone rejected configuration")
-                } else if (message.phase == 0 && negotiationRejected) {
-                    logDebug(
-                        "[PHASE] Phase 0 after negotiation rejection — not restarting",
-                        tag = Logger.Tags.ADAPTR,
-                    )
-                } else if (message.phase == 0 && state == State.STREAMING) {
-                    logWarn(
-                        "[PHASE] Phase 0 during STREAMING — session terminated by adapter",
-                        tag = Logger.Tags.ADAPTR,
-                    )
-                    setStatusText("Session terminated — restarting...")
+                logInfo("[PHASE] Received phase=${message.phase}", tag = Logger.Tags.ADAPTR)
+                if (message.phase == 0) {
+                    // Phase 0 = "Session Terminated" — firmware primary disconnect signal.
+                    // Firmware kills all phone-link processes before sending this.
+                    logInfo("[PHASE] Session terminated by firmware (phase=0) — disconnecting", tag = Logger.Tags.ADAPTR)
                     scope.launch { restart() }
-                } else if (message.phase == 0) {
-                    logDebug(
-                        "[PHASE] Phase 0 during $state — ignoring (normal session negotiation)",
-                        tag = Logger.Tags.ADAPTR,
-                    )
-                } else if (message.phase == 7) {
-                    setStatusText("Phone connecting...")
-                    logDebug("[PHASE] ${message.phase} (${message.phaseName})", tag = Logger.Tags.ADAPTR)
-                } else {
-                    logDebug("[PHASE] ${message.phase} (${message.phaseName})", tag = Logger.Tags.ADAPTR)
                 }
             }
 
-            // Navigation focus — echo back as recommended precaution (testing inconclusive)
-            is NaviFocusMessage -> {
-                if (message.isRequest) {
-                    logDebug("[NAVI] Navigation video focus requested — echoing 508", tag = Logger.Tags.ADAPTR)
-                    adapterDriver?.sendCommand(CommandMapping.REQUEST_NAVI_SCREEN_FOCUS)
-                } else {
-                    logDebug("[NAVI] Navigation video focus released — echoing 509", tag = Logger.Tags.ADAPTR)
-                    adapterDriver?.sendCommand(CommandMapping.RELEASE_NAVI_SCREEN_FOCUS)
-                }
-            }
-
-            // Diagnostic messages — logged for protocol completeness and event correlation
-            is StatusValueMessage -> {
-                logDebug("[STATUS] Value=${message.value} (0x${message.value.toString(16)})", tag = Logger.Tags.ADAPTR)
-            }
-
-            is SessionTokenMessage -> {
-                logDebug("[SESSION] Token received (${message.payloadSize}B encrypted)", tag = Logger.Tags.ADAPTR)
-            }
-
-            is BluetoothPairedListMessage -> {
-                logInfo(
-                    "[DEVICE] BluetoothPairedList: ${message.devices.size} devices (existing=${_deviceList.size})",
-                    tag = Logger.Tags.ADAPTR,
-                )
-                if (message.devices.isNotEmpty()) {
-                    // MERGE into existing list — 0x12 is sent multiple times:
-                    // at init (all devices) and after BT connect (just the connecting device).
-                    // Never shrink the list; only add/update entries.
-                    // BoxSettings DevList (0x19) is the authoritative full list.
-                    val existingByMac = _deviceList.associateBy { it.btMac }.toMutableMap()
-                    var changed = false
-                    for ((mac, name) in message.devices) {
-                        val existing = existingByMac[mac]
-                        if (existing != null) {
-                            // Update name if changed
-                            if (existing.name != name) {
-                                existingByMac[mac] = existing.copy(name = name)
-                                changed = true
-                            }
-                        } else {
-                            // New device not in current list
-                            existingByMac[mac] = DeviceInfo(
-                                btMac = mac,
-                                name = name,
-                                type = "", // Unknown from 0x12 — enriched when BoxSettings arrives
-                            )
-                            changed = true
-                        }
-                    }
-                    if (changed || _deviceList.isEmpty()) {
-                        _deviceList = existingByMac.values.toList()
-                        _deviceList.forEachIndexed { idx, dev ->
-                            logDebug(
-                                "[DEVICE] PairedList[$idx]: mac=${dev.btMac}, name=${dev.name}, type=${dev.type.ifEmpty { "unknown" }}",
-                                tag = Logger.Tags.ADAPTR,
-                            )
-                        }
-                        callback?.onDeviceListChanged(_deviceList)
-                        notifyDeviceListeners()
-                    }
-                }
-            }
-
-            is InfoMessage -> {
-                logDebug("[INFO] ${message.label}: ${message.value}", tag = Logger.Tags.ADAPTR)
-            }
-
-            is UnknownMessage -> {
-                unknownMessageTypeCount++
-                unknownMessageTypes.add(message.header.rawType)
-                logWarn(
-                    "[UNKNOWN] Unrecognized message type=0x${message.header.rawType.toString(16)} " +
-                        "(${message.header.length}B) payload=${message.hexPreview()}",
-                    tag = Logger.Tags.PROTO_UNKNOWN,
-                )
-            }
+            else -> {}
         }
 
         // Handle audio commands for mic capture
         if (message is AudioDataMessage && message.command != null) {
-            handleAudioCommand(message.command, message.decodeType, message.rawCommandId)
+            handleAudioCommand(message.command)
         }
     }
 
     private fun processAudioData(message: AudioDataMessage) {
         // Handle volume ducking
-        message.volumeDuration?.let {
-            audioManager?.setDucking(message.volume)
+        message.volumeDuration?.let { _ ->
+            audioManager?.setDucking(message.volume?.toFloat() ?: 1.0f)
             return
         }
 
@@ -1820,120 +1188,54 @@ class CarlinkManager(
         // Skip if no audio data
         val audioData = message.data ?: return
 
-        // Track adapter's current audio decodeType (for mic format negotiation)
-        lastIncomingDecodeType = message.decodeType
-
-        // Write audio with offset+length to avoid copy
-        // Two-factor routing: state flags + format match (not purpose) to prevent transition artifacts
-        audioManager?.writeAudio(
-            audioData,
-            message.audioDataOffset,
-            message.audioDataLength,
-            message.audioType,
-            message.decodeType,
-            AudioRoutingState(
-                isSiriActive = isSiriAudioActive,
-                isPhoneCallActive = isPhoneCallAudioActive,
-                isAlertActive = isAlertAudioActive,
-            ),
-        )
+        // Write audio
+        audioManager?.writeAudio(audioData, message.audioType, message.decodeType)
     }
 
-    private fun handleAudioCommand(command: AudioCommand, messageDecodeType: Int = 5, rawCommandId: Int = command.id) {
-        logDebug(
-            "[AUDIO_CMD] ${command.name} (id=${command.id} siri=$isSiriAudioActive call=$isPhoneCallAudioActive alert=$isAlertAudioActive)",
-            tag = Logger.Tags.AUDIO,
-        )
+    private fun handleAudioCommand(command: AudioCommand) {
+        logDebug("[AUDIO_CMD] Received audio command: ${command.name} (id=${command.id})", tag = Logger.Tags.AUDIO)
 
         when (command) {
             AudioCommand.AUDIO_NAVI_START -> {
                 logInfo("[AUDIO_CMD] Navigation audio START command received", tag = Logger.Tags.AUDIO)
-                // Reset navStopped so writeAudio() accepts packets (NAVI_COMPLETE may never arrive)
-                audioManager?.onNavStarted()
-                // Nav track is created on first packet; nav focus is requested in ensureNavTrack()
+                // Nav audio data will start arriving - track is created on first packet
             }
 
             AudioCommand.AUDIO_NAVI_STOP -> {
                 logInfo("[AUDIO_CMD] Navigation audio STOP command received", tag = Logger.Tags.AUDIO)
-                // Signal nav stopped - stop accepting new packets, but don't flush yet
-                // (NAVI_COMPLETE will handle final cleanup including focus abandon)
-                audioManager?.onNavStopped()
-            }
-
-            AudioCommand.AUDIO_NAVI_COMPLETE -> {
-                logInfo("[AUDIO_CMD] Navigation audio COMPLETE command received", tag = Logger.Tags.AUDIO)
-                // Explicit end-of-prompt signal from adapter - clean shutdown + abandon nav focus
                 audioManager?.stopNavTrack()
             }
 
             AudioCommand.AUDIO_SIRI_START -> {
-                logInfo("[AUDIO_CMD] Siri started - enabling microphone (mode: SIRI)", tag = Logger.Tags.MIC)
-                activeVoiceMode = VoiceMode.SIRI
-                isSiriAudioActive = true
-                setPurpose(StreamPurpose.SIRI, command)
+                logInfo("[AUDIO_CMD] Siri started - enabling microphone", tag = Logger.Tags.MIC)
                 startMicrophoneCapture(decodeType = 5, audioType = 3)
             }
 
             AudioCommand.AUDIO_PHONECALL_START -> {
-                val micDecodeType = lastIncomingDecodeType
-                logInfo("[AUDIO_CMD] Phone call started - enabling microphone (mode: PHONECALL, decodeType=$micDecodeType)", tag = Logger.Tags.MIC)
-                activeVoiceMode = VoiceMode.PHONECALL
-                isPhoneCallAudioActive = true
-                setPurpose(StreamPurpose.PHONE_CALL, command)
-                startMicrophoneCapture(decodeType = micDecodeType, audioType = 3)
+                logInfo("[AUDIO_CMD] Phone call started - enabling microphone", tag = Logger.Tags.MIC)
+                startMicrophoneCapture(decodeType = 5, audioType = 3)
             }
 
             AudioCommand.AUDIO_SIRI_STOP -> {
-                // CRITICAL: Don't stop mic if phone call is active (Siri-initiated call scenario)
-                // USB capture shows: PHONECALL_START arrives ~130ms BEFORE SIRI_STOP
-                // Always clear siri routing flag (audio routing is independent of mic lifecycle)
-                isSiriAudioActive = false
-                if (activeVoiceMode == VoiceMode.PHONECALL) {
-                    logInfo(
-                        "[AUDIO_CMD] Siri stopped but phone call active - keeping mic for call",
-                        tag = Logger.Tags.MIC,
-                    )
-                    logDebug(
-                        "[AUDIO_PURPOSE] SIRI_STOP: siri routing cleared, keeping mic for PHONE_CALL",
-                        tag = Logger.Tags.AUDIO_DEBUG,
-                    )
-                    // Don't stop mic or end SIRI AudioFocus — PHONE_CALL handles both
-                } else {
-                    logInfo("[AUDIO_CMD] Siri stopped - disabling microphone", tag = Logger.Tags.MIC)
-                    activeVoiceMode = VoiceMode.NONE
-                    endPurpose(StreamPurpose.SIRI, command)
-                    stopMicrophoneCapture()
-                }
+                logInfo("[AUDIO_CMD] Siri stopped - disabling microphone", tag = Logger.Tags.MIC)
+                stopMicrophoneCapture()
+                audioManager?.stopVoiceTrack()
             }
 
             AudioCommand.AUDIO_PHONECALL_STOP -> {
                 logInfo("[AUDIO_CMD] Phone call stopped - disabling microphone", tag = Logger.Tags.MIC)
-                activeVoiceMode = VoiceMode.NONE
-                isPhoneCallAudioActive = false
-                endPurpose(StreamPurpose.PHONE_CALL, command)
                 stopMicrophoneCapture()
+                audioManager?.stopCallTrack()
             }
 
             AudioCommand.AUDIO_MEDIA_START -> {
                 logDebug("[AUDIO_CMD] Media audio START command received", tag = Logger.Tags.AUDIO)
-                setPurpose(StreamPurpose.MEDIA, command)
+                // Media audio data will start arriving - track is created on first packet
             }
 
             AudioCommand.AUDIO_MEDIA_STOP -> {
                 logDebug("[AUDIO_CMD] Media audio STOP command received", tag = Logger.Tags.AUDIO)
-                endPurpose(StreamPurpose.MEDIA, command)
-            }
-
-            AudioCommand.AUDIO_ALERT_START -> {
-                logDebug("[AUDIO_CMD] Alert started", tag = Logger.Tags.AUDIO)
-                isAlertAudioActive = true
-                setPurpose(StreamPurpose.ALERT, command)
-            }
-
-            AudioCommand.AUDIO_ALERT_STOP -> {
-                logDebug("[AUDIO_CMD] Alert stopped", tag = Logger.Tags.AUDIO)
-                isAlertAudioActive = false
-                endPurpose(StreamPurpose.ALERT, command)
+                // Media track typically stays active, but log for debugging
             }
 
             AudioCommand.AUDIO_OUTPUT_START -> {
@@ -1944,54 +1246,10 @@ class CarlinkManager(
                 logDebug("[AUDIO_CMD] Audio output STOP command received", tag = Logger.Tags.AUDIO)
             }
 
-            AudioCommand.AUDIO_INCOMING_CALL_INIT -> {
-                logInfo("[AUDIO_CMD] Incoming call ring (AudioCmd 14)", tag = Logger.Tags.AUDIO)
-                setPurpose(StreamPurpose.RINGTONE, command)
-            }
-
-            AudioCommand.AUDIO_INPUT_CONFIG -> {
-                logDebug("[AUDIO_CMD] AUDIO_INPUT_CONFIG received (decodeType=$messageDecodeType)", tag = Logger.Tags.AUDIO)
-                lastIncomingDecodeType = messageDecodeType
-                // If mic is active, restart capture at the adapter's requested format
-                // (mirrors Autokit: case 3 → a.i = w.a → h.h(c(w.a, true)))
-                if (isMicrophoneCapturing && currentMicDecodeType != messageDecodeType) {
-                    logInfo("[AUDIO_CMD] INPUT_CONFIG: switching mic from decodeType=$currentMicDecodeType to $messageDecodeType", tag = Logger.Tags.MIC)
-                    stopMicrophoneCapture()
-                    startMicrophoneCapture(decodeType = messageDecodeType, audioType = currentMicAudioType)
-                }
-            }
-
-            AudioCommand.UNKNOWN -> {
-                unknownAudioCommandCount++
-                unknownAudioCommandIds.add(rawCommandId)
-                logWarn(
-                    "[AUDIO_CMD] Unknown audio command rawId=$rawCommandId (0x${rawCommandId.toString(16)})",
-                    tag = Logger.Tags.PROTO_UNKNOWN,
-                )
+            else -> {
+                logDebug("[AUDIO_CMD] Unhandled audio command: ${command.name}", tag = Logger.Tags.AUDIO)
             }
         }
-    }
-
-    /** Request AudioFocus for a stream purpose. */
-    private fun setPurpose(purpose: StreamPurpose, trigger: AudioCommand) {
-        if (!config.audioTransferMode) {
-            audioManager?.onPurposeChanged(purpose)
-        }
-        logDebug(
-            "[AUDIO_PURPOSE] → $purpose (trigger: ${trigger.name} voiceMode: $activeVoiceMode)",
-            tag = Logger.Tags.AUDIO_DEBUG,
-        )
-    }
-
-    /** Abandon AudioFocus for a stream purpose. */
-    private fun endPurpose(purpose: StreamPurpose, trigger: AudioCommand) {
-        if (!config.audioTransferMode) {
-            audioManager?.onPurposeEnded(purpose)
-        }
-        logDebug(
-            "[AUDIO_PURPOSE] Ended $purpose (trigger: ${trigger.name})",
-            tag = Logger.Tags.AUDIO_DEBUG,
-        )
     }
 
     private fun startMicrophoneCapture(
@@ -2005,7 +1263,7 @@ class CarlinkManager(
             stopMicrophoneCapture()
         }
 
-        val started = microphoneManager?.start(decodeType) ?: false
+        val started = microphoneManager?.start() ?: false
         if (started) {
             isMicrophoneCapturing = true
             currentMicDecodeType = decodeType
@@ -2044,8 +1302,7 @@ class CarlinkManager(
     private fun sendMicrophoneData() {
         if (!isMicrophoneCapturing) return
 
-        val chunkSize = if (currentMicDecodeType == 3) 320 else 640 // 20ms at 8kHz or 16kHz mono
-        val data = microphoneManager?.readChunk(maxBytes = chunkSize) ?: return
+        val data = microphoneManager?.readChunk(maxBytes = 640) ?: return
         if (data.isNotEmpty()) {
             adapterDriver?.sendAudio(
                 data = data,
@@ -2056,68 +1313,13 @@ class CarlinkManager(
     }
 
     private fun processMediaMetadata(message: MediaDataMessage) {
-        // Route NaviJSON to NavigationStateManager for cluster display (only if enabled)
-        if (message.type == MediaType.NAVI_JSON) {
-            if (AdapterConfigPreference.getInstance(context).getClusterNavigationSync()) {
-                NavigationStateManager.onNaviJson(message.payload)
-            }
-            return
-        }
-
-        // Route AA maneuver icons to NavigationStateManager (sub-type 201)
-        if (message.type == MediaType.NAVI_IMAGE) {
-            if (AdapterConfigPreference.getInstance(context).getClusterNavigationSync()) {
-                val imageData = message.payload["NaviImage"] as? ByteArray
-                if (imageData != null) {
-                    NavigationStateManager.onNaviImage(imageData)
-                } else {
-                    logWarn("[NAVI_ICON] NAVI_IMAGE message with no image data", tag = Logger.Tags.NAVI)
-                }
-            }
-            return
-        }
-
-        // Android Auto album art arrives as a standalone MEDIA_DATA subtype 2 message (PNG).
-        // Cache it and push a metadata update so MediaSession gets the cover immediately,
-        // without waiting for the next subtype-1 JSON tick which carries no image bytes.
-        if (message.type == MediaType.ALBUM_COVER_AA) {
-            val coverBytes = message.payload["AlbumCover"] as? ByteArray
-            if (coverBytes != null) {
-                lastAlbumCover = coverBytes
-                mediaSessionManager?.updateMetadata(
-                    title = lastMediaSongName,
-                    artist = lastMediaArtistName,
-                    album = lastMediaAlbumName,
-                    appName = lastMediaAppName,
-                    albumArt = lastAlbumCover,
-                    duration = lastDuration,
-                )
-            }
-            return
-        }
-
-        // Unknown MediaData subtype — log everything for protocol discovery
-        if (message.type == MediaType.UNKNOWN) {
-            unknownMediaSubtypeCount++
-            val subtype = message.payload["_unknownSubtype"]
-            if (subtype is Int) unknownMediaSubtypes.add(subtype)
-            val hex = message.payload["_hexPreview"] ?: ""
-            logWarn(
-                "[MEDIA_UNKNOWN] Unrecognized MediaData subtype=$subtype " +
-                    "(${message.header.length}B) payload=$hex",
-                tag = Logger.Tags.PROTO_UNKNOWN,
-            )
-            return
-        }
-
         val payload = message.payload
 
         // Extract new song title (if present)
         val newSongName = (payload["MediaSongName"] as? String)?.takeIf { it.isNotEmpty() }
 
-        // Detect song change — clear all cached metadata to prevent stale data mixing
-        val previousSongName = lastMediaSongName
-        if (newSongName != null && newSongName != previousSongName) {
+        // If song title changed, clear all cached metadata to prevent stale data mixing
+        if (newSongName != null && newSongName != lastMediaSongName) {
             lastMediaSongName = null
             lastMediaArtistName = null
             lastMediaAlbumName = null
@@ -2145,17 +1347,6 @@ class CarlinkManager(
             lastAlbumCover = albumCover
         }
 
-        // Extract playback fields (missing before: position, duration, play status)
-        val duration = (payload["MediaSongDuration"] as? Number)?.toLong() ?: lastDuration
-        val position = (payload["MediaSongPlayTime"] as? Number)?.toLong() ?: lastPosition
-        val playStatus = (payload["MediaPlayStatus"] as? Number)?.toInt()
-        val isPlaying = if (playStatus != null) playStatus == 1 else lastIsPlaying
-
-        // Cache playback fields
-        lastDuration = duration
-        lastPosition = position
-        lastIsPlaying = isPlaying
-
         val mediaInfo =
             MediaInfo(
                 songTitle = lastMediaSongName,
@@ -2163,116 +1354,54 @@ class CarlinkManager(
                 albumName = lastMediaAlbumName,
                 appName = lastMediaAppName,
                 albumCover = lastAlbumCover,
-                duration = duration,
-                position = position,
-                isPlaying = isPlaying,
             )
 
-        // Detect whether metadata actually changed (song change or new album cover)
-        // Position-only ticks (~95% of messages) skip the expensive metadata path
-        val metadataChanged =
-            (newSongName != null && newSongName != previousSongName) ||
-                albumCover != null
+        callback?.onMediaInfoChanged(mediaInfo)
 
-        if (metadataChanged) {
-            // Full metadata update (title/artist/album/cover/duration)
-            mediaSessionManager?.updateMetadata(
-                title = mediaInfo.songTitle,
-                artist = mediaInfo.songArtist,
-                album = mediaInfo.albumName,
-                appName = mediaInfo.appName,
-                albumArt = mediaInfo.albumCover,
-                duration = duration,
-            )
-
-            // Update foreground notification with current now-playing
-            CarlinkMediaBrowserService.updateNowPlaying(mediaInfo.songTitle, mediaInfo.songArtist)
-        }
-
-        // Always update playback state (position ticks are the common case)
-        mediaSessionManager?.updatePlaybackState(playing = isPlaying, position = position)
+        // Update MediaSession
+        mediaSessionManager?.updateMetadata(
+            title = mediaInfo.songTitle,
+            artist = mediaInfo.songArtist,
+            album = mediaInfo.albumName,
+            appName = mediaInfo.appName,
+            albumArt = mediaInfo.albumCover,
+        )
+        mediaSessionManager?.updatePlaybackState(playing = true)
     }
 
     /**
-     * Error handler for adapter communication failures.
+     * Simple error handler matching Flutter CarlinkPlugin.kt pattern.
      *
-     * Performs full session cleanup (matching stop()) so that start() called
-     * from reconnect sees a clean slate. Without this, start() finds a non-null
-     * adapterDriver, calls stop(), which calls cancelReconnect() — killing the
-     * very coroutine that invoked start().
-     *
-     * For USB disconnects, schedules auto-reconnect with exponential backoff.
+     * Recovery strategy (simple, proven):
+     * 1. Check if error is recoverable
+     * 2. Track consecutive resets within time window
+     * 3. If threshold reached, perform emergency cleanup
+     * 4. Otherwise, notify and let system recover naturally
+     * 5. For USB disconnects, schedule auto-reconnect with exponential backoff
      */
     private fun handleError(error: String) {
         clearPairTimeout()
 
         logError("Adapter error: $error", tag = Logger.Tags.ADAPTR)
 
-        // Full session state reset (mirrors stop() minus cancelReconnect/graceful teardown)
-        cancelDelayedKeyframe()
-        negotiationRejected = false
-        pendingConnectTarget = null
-        lastConnectTargetMac = null
+        // Check if this is a recoverable error and track for error recovery
+        if (isRecoverableError(error)) {
+            // For recoverable errors (codec reset), keep frame interval running
+            // This ensures periodic keyframe requests continue during recovery
+            handleCodecReset()
+            // Don't change state for recoverable errors - stay in STREAMING if we were
+            return
+        }
+
+        // Only stop frame interval for non-recoverable errors
+        stopFrameInterval()
         currentPhoneType = null
-        currentWifi = null
-        videoPhoneTypeInferred = false
-        codecDeferred = true
-        videoEncoderType = 2
-        videoOffScreen = 0
-        callback?.onPhoneTypeChanged(PhoneType.UNKNOWN)
-        clearCachedMediaMetadata()
-        activeVoiceMode = VoiceMode.NONE
-        isSiriAudioActive = false
-        isPhoneCallAudioActive = false
-        isAlertAudioActive = false
-        stopMicrophoneCapture()
-        gnssForwarder?.stop()
 
-        // Stop adapter driver (heartbeat, reading loop) and close USB.
-        // Skip graceful teardown — USB is likely dead.
-        adapterDriver?.stop()
-        adapterDriver = null
-        usbDevice?.close()
-        usbDevice = null
-
-        if (audioInitialized) {
-            audioManager?.release()
-            audioInitialized = false
-        }
-
-        // Pattern A: track consecutive "no initial response" errors (adapter USB write dead)
-        // Pattern C: track short-lived STREAMING sessions (unstable adapter)
-        val isNoResponse = error.contains("no initial response")
-        if (isNoResponse) {
-            consecutiveNoResponse++
-        } else {
-            consecutiveNoResponse = 0
-        }
-
-        if (lastStreamingStartMs > 0) {
-            val sessionDuration = System.currentTimeMillis() - lastStreamingStartMs
-            if (sessionDuration < SHORT_SESSION_THRESHOLD_MS) {
-                shortLivedStreamingCount++
-            }
-            lastStreamingStartMs = 0L
-        }
-
+        // Set state to disconnected
         setState(State.DISCONNECTED)
 
         // Schedule auto-reconnect for USB disconnect errors
         if (isUsbDisconnectError(error)) {
-            // Escalate status based on observed patterns
-            if (consecutiveNoResponse >= 2) {
-                // Pattern A: adapter USB write dead — retrying won't help
-                setStatusText("Adapter not responding — reboot adapter")
-                logWarn("[ESCALATION] Pattern A: $consecutiveNoResponse consecutive no-response errors", tag = Logger.Tags.USB)
-            } else if (shortLivedStreamingCount >= SHORT_SESSION_ESCALATION_COUNT) {
-                // Pattern C: sessions keep dying within seconds
-                setStatusText("Connection unstable — reboot adapter")
-                logWarn("[ESCALATION] Pattern C: $shortLivedStreamingCount short-lived sessions", tag = Logger.Tags.USB)
-            } else if (isNoResponse) {
-                setStatusText("Adapter not responding — reconnecting...")
-            }
             scheduleReconnect()
         }
     }
@@ -2307,24 +1436,12 @@ class CarlinkManager(
         if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
             logWarn(
                 "[RECONNECT] Max attempts ($MAX_RECONNECT_ATTEMPTS) reached, giving up. " +
-                    "noResponse=$consecutiveNoResponse shortSessions=$shortLivedStreamingCount hadPrior=$hadPriorSession",
+                    "User must manually restart.",
                 tag = Logger.Tags.USB,
             )
-            val giveUpMessage = when {
-                consecutiveNoResponse >= 2 -> "Adapter not responding — reboot adapter"
-                shortLivedStreamingCount >= SHORT_SESSION_ESCALATION_COUNT -> "Connection unstable — reboot adapter"
-                hadPriorSession -> "Phone not reconnecting — reboot adapter"
-                else -> "Adapter not responding — unplug and replug adapter"
-            }
             reconnectAttempts = 0
-            setStatusText(giveUpMessage)
-            // Stop FGS since we're no longer attempting to reconnect
-            CarlinkMediaBrowserService.stopConnectionForeground(context)
             return
         }
-
-        // Maintain foreground priority during reconnect delay to prevent LMK kill
-        CarlinkMediaBrowserService.startConnectionForeground(context)
 
         // Calculate delay with exponential backoff, capped at max
         val delay =
@@ -2339,17 +1456,15 @@ class CarlinkManager(
             tag = Logger.Tags.USB,
         )
 
-        setStatusText("Reconnecting ($reconnectAttempts/$MAX_RECONNECT_ATTEMPTS)...")
-
         reconnectJob =
             scope.launch {
-                delay(delay)
+                kotlinx.coroutines.delay(delay)
 
                 // Only attempt if still disconnected
                 if (state == State.DISCONNECTED) {
                     logInfo("[RECONNECT] Attempting reconnection...", tag = Logger.Tags.USB)
                     try {
-                        withContext(Dispatchers.IO) { start() }
+                        start()
                     } catch (e: Exception) {
                         logError("[RECONNECT] Reconnection failed: ${e.message}", tag = Logger.Tags.USB)
                         // handleError will be called by start() failure, which will schedule next attempt
@@ -2370,236 +1485,205 @@ class CarlinkManager(
         reconnectAttempts = 0
     }
 
+    /**
+     * Checks if an error is recoverable.
+     * Matches Flutter: CarlinkPlugin.kt isRecoverableError()
+     */
+    private fun isRecoverableError(error: String): Boolean {
+        val lowerError = error.lowercase()
+        return when {
+            // MediaCodec-specific errors that typically indicate recoverable issues
+            lowerError.contains("reset codec") -> true
+
+            lowerError.contains("mediacodec") && lowerError.contains("illegalstateexception") -> true
+
+            lowerError.contains("codecexception") -> true
+
+            // Surface texture related errors that may be recoverable
+            lowerError.contains("surface") && lowerError.contains("invalid") -> true
+
+            else -> false
+        }
+    }
+
+    /**
+     * Handles MediaCodec reset tracking with thread-safe error recovery.
+     * Matches Flutter: CarlinkPlugin.kt handleCodecReset()
+     *
+     * Synchronized to prevent race conditions when multiple threads
+     * encounter errors simultaneously.
+     */
+    @Synchronized
+    private fun handleCodecReset() {
+        val currentTime = System.currentTimeMillis()
+
+        // Reset counter if outside the window
+        if (currentTime - lastResetTime > RESET_WINDOW_MS) {
+            consecutiveResets = 0
+        }
+
+        consecutiveResets++
+        lastResetTime = currentTime
+
+        logInfo("[ERROR RECOVERY] Reset count: $consecutiveResets in window", tag = Logger.Tags.ADAPTR)
+
+        // CRITICAL: Ensure frame interval is running after codec reset
+        // This fixes the bug where timer stopped during disconnect and never restarted
+        logDebug("[ERROR RECOVERY] Ensuring frame interval running after codec reset", tag = Logger.Tags.VIDEO)
+        ensureFrameIntervalRunning()
+
+        // If we've hit the threshold, perform complete cleanup
+        if (consecutiveResets >= RESET_THRESHOLD) {
+            logWarn("[ERROR RECOVERY] Threshold reached, performing complete system cleanup", tag = Logger.Tags.ADAPTR)
+            performEmergencyCleanup()
+            consecutiveResets = 0 // Reset counter after cleanup
+        }
+    }
+
+    /**
+     * Performs emergency cleanup to prevent cascade failures.
+     * Matches Flutter: CarlinkPlugin.kt performEmergencyCleanup()
+     *
+     * Simple cleanup - just reset video and close USB.
+     * Does NOT attempt automatic restart (let user/system decide).
+     */
+    private fun performEmergencyCleanup() {
+        try {
+            logWarn("[EMERGENCY CLEANUP] Starting conservative system cleanup", tag = Logger.Tags.ADAPTR)
+
+            // Reset video renderer using manager
+            try {
+                h264Renderer?.reset()
+                lastDecoderResetMs = android.os.SystemClock.uptimeMillis()
+                logInfo("[EMERGENCY CLEANUP] Video renderer reset", tag = Logger.Tags.ADAPTR)
+            } catch (e: Exception) {
+                logError("[EMERGENCY CLEANUP] Video reset error: ${e.message}", tag = Logger.Tags.ADAPTR)
+            }
+
+            // Close USB connection properly
+            try {
+                adapterDriver?.stop()
+                adapterDriver = null
+                usbDevice?.close()
+                usbDevice = null
+                logInfo("[EMERGENCY CLEANUP] USB connection closed", tag = Logger.Tags.ADAPTR)
+            } catch (e: Exception) {
+                logError("[EMERGENCY CLEANUP] USB close error: ${e.message}", tag = Logger.Tags.ADAPTR)
+            }
+
+            logWarn("[EMERGENCY CLEANUP] Conservative cleanup finished", tag = Logger.Tags.ADAPTR)
+        } catch (e: Exception) {
+            logError("[EMERGENCY CLEANUP] State error: ${e.message}", tag = Logger.Tags.ADAPTR)
+        }
+    }
+
     private fun clearPairTimeout() {
         pairTimeout?.cancel()
         pairTimeout = null
     }
 
     /**
-     * Schedule keyframe requests for CarPlay sessions.
+     * Ensures the periodic keyframe request is running for CarPlay connections.
      *
-     * 1. Initial delayed request (2.5s): The adapter sends a natural SPS+PPS+IDR at session
-     *    start which the codec decodes immediately. This delayed request serves as a cold-start
-     *    safety net — if the decoder is poisoned (observed on Intel hardware, first session only),
-     *    the fresh IDR on a now-warm codec clears the poisoned state.
+     * Safe to call multiple times - will not create duplicate jobs.
+     * Uses coroutines for better lifecycle management and error handling.
      *
-     * 2. Periodic interval (30s): Passive self-healing against mid-session decoder corruption
-     *    from platform instability. The GM Info 3.7 Intel Atom x7-A3960 platform has a
-     *    poorly designed VPU/USB subsystem where silent decoder corruption can occur from
-     *    USB bulk stalls, GHS hypervisor interrupts, or Intel VPU firmware bugs — factors
-     *    outside the app's control. The watchdog only catches complete decode failure (Rx>0,
-     *    Dec=0), NOT progressive quality degradation from corrupted reference frames.
-     *    A periodic IDR is the only fix for silent corruption.
-     *
-     *    CarPlay encoder teardown is invisible to the user at any reasonable interval.
-     *    The 30s value is configurable per-platform — 2s was used historically with no
-     *    user-visible impact. Shorter intervals trade iPhone encoder overhead for faster
-     *    corruption recovery. Adjust the delay value below as needed.
-     *
-     * Cancels any pending request first. AA must NOT use this — FRAME resets phone UI.
+     * Per CPC200-CCPA protocol, FRAME command should be sent every 5 seconds
+     * during active CarPlay sessions to maintain decoder stability.
      */
     @Synchronized
-    private fun scheduleDelayedKeyframe() {
-        frameIntervalJob?.cancel()
+    private fun ensureFrameIntervalRunning() {
+        val phoneType = currentPhoneType
+        val jobActive = frameIntervalJob?.isActive == true
+
+        // Only for CarPlay - protocol specifies 5s keyframe interval
+        if (phoneType != PhoneType.CARPLAY) {
+            logDebug("[FRAME_INTERVAL] Skipping - phoneType=$phoneType (not CarPlay)", tag = Logger.Tags.VIDEO)
+            return
+        }
+
+        // Already running - nothing to do
+        if (jobActive) {
+            logDebug("[FRAME_INTERVAL] Already running - no action needed", tag = Logger.Tags.VIDEO)
+            return
+        }
+
+        logInfo("[FRAME_INTERVAL] Starting periodic keyframe request (every 5s) for CarPlay", tag = Logger.Tags.VIDEO)
+
         frameIntervalJob =
             scope.launch(Dispatchers.IO) {
-                logInfo("[FRAME_INTERVAL] CarPlay keyframe scheduled (2.5s initial, 30s periodic)", tag = Logger.Tags.VIDEO)
-
-                // Initial delayed keyframe — cold-start safety net
-                delay(2500)
-                val initialSent = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
-                logInfo("[FRAME_INTERVAL] CarPlay initial keyframe sent=$initialSent", tag = Logger.Tags.VIDEO)
-
-                // Periodic keyframe — mid-session self-healing for unstable platforms (GM Intel VPU)
                 var requestCount = 0
                 while (isActive) {
-                    delay(30000)
+                    delay(5000)
                     requestCount++
                     val sent = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
-                    logDebug("[FRAME_INTERVAL] CarPlay periodic keyframe #$requestCount sent=$sent", tag = Logger.Tags.VIDEO)
+                    logDebug("[FRAME_INTERVAL] Keyframe request #$requestCount sent=$sent", tag = Logger.Tags.VIDEO)
                 }
+                logDebug("[FRAME_INTERVAL] Coroutine ended after $requestCount requests", tag = Logger.Tags.VIDEO)
             }
     }
 
     /**
-     * Cancel any pending delayed keyframe request.
+     * Stops the periodic keyframe request.
      */
     @Synchronized
-    private fun cancelDelayedKeyframe() {
+    private fun stopFrameInterval() {
         val wasActive = frameIntervalJob?.isActive == true
         if (wasActive) {
-            logDebug("[FRAME_INTERVAL] Cancelling pending delayed keyframe", tag = Logger.Tags.VIDEO)
+            logInfo("[FRAME_INTERVAL] Stopping periodic keyframe request (wasActive=$wasActive)", tag = Logger.Tags.VIDEO)
             frameIntervalJob?.cancel()
+        } else {
+            logDebug("[FRAME_INTERVAL] Stop called but job not active (wasActive=$wasActive)", tag = Logger.Tags.VIDEO)
         }
         frameIntervalJob = null
     }
 
     /**
-     * Create a video processor for direct USB -> codec data flow.
-     * [DIRECT_HANDOFF]: Data is already in a buffer. Feed codec directly or drop.
+     * Create a video processor for direct USB -> ring buffer data flow.
+     * This bypasses message parsing and matches Flutter's zero-copy architecture.
      *
-     * Video header structure (20 bytes):
-     * - offset 0: width (4 bytes)
-     * - offset 4: height (4 bytes)
-     * - offset 8: encoderState (4 bytes) - encoder generation/stream ID (values echoed in touch flags for AutoKit compat)
-     * - offset 12: pts (4 bytes) - SOURCE PRESENTATION TIMESTAMP (milliseconds, logged only — codec uses elapsed-time PTS)
-     * - offset 16: flags (4 bytes) - usually 0 (reserved)
+     * The processor reads USB data directly into the H264Renderer's ring buffer,
+     * skipping the 20-byte video header (width, height, flags, length, unknown).
      */
-    private fun createVideoProcessor(): UsbDeviceWrapper.VideoDataProcessor {
-        return object : UsbDeviceWrapper.VideoDataProcessor {
-            override fun processVideoDirect(
-                data: ByteArray,
-                dataLength: Int,
-                sourcePtsMs: Int,
-            ) {
-                val renderer =
-                    h264Renderer ?: run {
-                        // Data already read by UsbDeviceWrapper — just discard by returning
-                        val now = System.currentTimeMillis()
-                        if (now - lastVideoDiscardWarningTime > 2000) {
+        private fun createVideoProcessor(): UsbDeviceWrapper.VideoDataProcessor {
+            return object : UsbDeviceWrapper.VideoDataProcessor {
+                override fun processVideoDirect(
+                    payloadLength: Int,
+                    readCallback: (buffer: ByteArray, offset: Int, length: Int) -> Int,
+                ) {
+                    // Gate: Drop video while paused or renderer missing
+                    if (videoPaused || h264Renderer == null) {
+                        var remaining = payloadLength
+                        while (remaining > 0) {
+                            val toRead = minOf(remaining, discardVideoBuffer.size)
+                            val bytesRead = readCallback(discardVideoBuffer, 0, toRead)
+                            if (bytesRead <= 0) {
+                                logWarn("[VIDEO_GATE] Partial USB read during discard - may stall endpoint", tag = Logger.Tags.VIDEO)
+                                break
+                            }
+                            remaining -= bytesRead
+                        }
+
+                        val now = android.os.SystemClock.uptimeMillis()
+                        if (now - lastVideoDiscardWarningTime > 5000) {
                             lastVideoDiscardWarningTime = now
-                            logWarn("Video frame discarded - H264Renderer not initialized.", tag = Logger.Tags.VIDEO)
+                            logInfo("[VIDEO_GATE] Dropped video packet while paused (size=$payloadLength)", tag = Logger.Tags.VIDEO)
                         }
                         return
                     }
 
-                // Start codec on first video if still deferred (PLUGGED arrived but was CarPlay,
-                // or fallback for protocols that send video before PLUGGED).
-                if (codecDeferred) {
-                    startCodecIfDeferred()
-                }
-
-                if (++videoFrameCount % 30 == 0L) {
-                    logVideoUsb { "processVideoDirect: frame=$videoFrameCount dataLength=$dataLength, pts=$sourcePtsMs" }
-                }
-
-                // Parse encoder state from video header for touch flags (AutoKit compatibility).
-                // Offset 8: AutoKit bitmask convention (bit 0 = offScreen, bits 2-3 = encoderType).
-                // Values echoed in touch payload only — not used for codec decisions.
-                if (dataLength >= 12) {
-                    val flags =
-                        (data[8].toInt() and 0xFF) or ((data[9].toInt() and 0xFF) shl 8) or
-                            ((data[10].toInt() and 0xFF) shl 16) or ((data[11].toInt() and 0xFF) shl 24)
-                    videoOffScreen = flags and 1
-                    val rawEncoder = (flags shr 2) and 3
-                    videoEncoderType =
-                        when (rawEncoder) {
-                            0 -> 2
-
-                            // H265
-                            1 -> 1
-
-                            // H264
-                            2 -> 4
-
-                            // MJPEG
-                            else -> 2
-                        }
-                }
-
-                // Infer phone type from video header if PLUGGED was missed (mid-session rejoin).
-                // Video header: [0..3]=width, [4..7]=height (LE int32). AA tiers are exactly
-                // 800x480, 1280x720, or 1920x1080. CarPlay uses arbitrary display dims.
-                if (!videoPhoneTypeInferred && currentPhoneType == null && dataLength >= 8) {
-                    videoPhoneTypeInferred = true
-                    val w =
-                        (data[0].toInt() and 0xFF) or ((data[1].toInt() and 0xFF) shl 8) or
-                            ((data[2].toInt() and 0xFF) shl 16) or ((data[3].toInt() and 0xFF) shl 24)
-                    val h =
-                        (data[4].toInt() and 0xFF) or ((data[5].toInt() and 0xFF) shl 8) or
-                            ((data[6].toInt() and 0xFF) shl 16) or ((data[7].toInt() and 0xFF) shl 24)
-                    val isAaTier = (w == 1920 && h == 1080) || (w == 1280 && h == 720) || (w == 800 && h == 480)
-                    if (isAaTier) {
-                        logInfo("[VIDEO] Inferred ANDROID_AUTO from video header ${w}x$h (mid-session)", tag = Logger.Tags.VIDEO)
-                        currentPhoneType = PhoneType.ANDROID_AUTO
-                        h264Renderer?.setAndroidAutoMode(true)
-                        callback?.onPhoneTypeChanged(PhoneType.ANDROID_AUTO)
-                    } else {
-                        logInfo("[VIDEO] Inferred CARPLAY from video header ${w}x$h (mid-session)", tag = Logger.Tags.VIDEO)
-                        currentPhoneType = PhoneType.CARPLAY
-                        h264Renderer?.setAndroidAutoMode(false)
-                        callback?.onPhoneTypeChanged(PhoneType.CARPLAY)
-                        scheduleDelayedKeyframe()
+                    // Normal processing
+                    logVideoUsb { "processVideoDirect: payloadLength=$payloadLength" }
+                    h264Renderer?.processDataDirect(payloadLength, 20) { buffer, offset ->
+                        readCallback(buffer, offset, payloadLength)
                     }
-                }
-
-                // Skip 20-byte video header, feed H.264 data directly to codec
-                if (dataLength > 20) {
-                    renderer.feedDirect(data, 20, dataLength - 20)
                 }
             }
         }
-    }
-
-    private fun tryPrestageCodecCsd(btMac: String) {
-        val cacheKey = "${btMac}_${config.width}x${config.height}"
-        val prefs = context.getSharedPreferences("carlink_csd_cache", Context.MODE_PRIVATE)
-        val spsB64 = prefs.getString("sps_$cacheKey", null) ?: return
-        val ppsB64 = prefs.getString("pps_$cacheKey", null) ?: return
-
-        val sps = android.util.Base64.decode(spsB64, android.util.Base64.NO_WRAP)
-        val pps = android.util.Base64.decode(ppsB64, android.util.Base64.NO_WRAP)
-
-        logInfo("[DEVICE] CSD cache hit for $cacheKey — pre-warming codec", tag = Logger.Tags.VIDEO)
-        h264Renderer?.configureWithCsd(sps, pps)
-    }
-
-    private fun parseDevList(json: JSONObject): List<DeviceInfo> {
-        val arr = json.optJSONArray("DevList") ?: return emptyList()
-        return (0 until arr.length()).mapNotNull { i ->
-            val obj = arr.optJSONObject(i) ?: return@mapNotNull null
-            val id = obj.optString("id", "")
-            if (id.isEmpty()) return@mapNotNull null
-            DeviceInfo(
-                btMac = id,
-                name = obj.optString("name", id), // fallback to MAC if no name
-                type = obj.optString("type", ""),
-                lastConnected = obj.optString("time", "").ifEmpty { null },
-                rfcomm = obj.optString("rfcomm", "").ifEmpty { null },
-            )
-        }
-    }
 
     private fun log(message: String) {
         logDebug(message, tag = Logger.Tags.ADAPTR)
-    }
-
-    private fun resetUnknownCounters() {
-        unknownMessageTypeCount = 0
-        unknownMediaSubtypeCount = 0
-        unknownCommandCount = 0
-        unknownAudioCommandCount = 0
-        unknownPhoneTypeCount = 0
-        unknownBoxSettingsKeyCount = 0
-        unknownMessageTypes.clear()
-        unknownMediaSubtypes.clear()
-        unknownCommandIds.clear()
-        unknownAudioCommandIds.clear()
-        videoFrameCount = 0L
-    }
-
-    private fun dumpUnknownSummary() {
-        val total = unknownMessageTypeCount + unknownMediaSubtypeCount +
-            unknownCommandCount + unknownAudioCommandCount +
-            unknownPhoneTypeCount + unknownBoxSettingsKeyCount
-        if (total == 0) return
-
-        val parts = mutableListOf<String>()
-        if (unknownMessageTypeCount > 0)
-            parts += "msgTypes=${unknownMessageTypeCount}x${unknownMessageTypes.map { "0x${it.toString(16)}" }}"
-        if (unknownMediaSubtypeCount > 0)
-            parts += "mediaSubtypes=${unknownMediaSubtypeCount}x$unknownMediaSubtypes"
-        if (unknownCommandCount > 0)
-            parts += "commands=${unknownCommandCount}x${unknownCommandIds.map { "0x${it.toString(16)}" }}"
-        if (unknownAudioCommandCount > 0)
-            parts += "audioCmds=${unknownAudioCommandCount}x$unknownAudioCommandIds"
-        if (unknownPhoneTypeCount > 0)
-            parts += "phoneTypes=${unknownPhoneTypeCount}x"
-        if (unknownBoxSettingsKeyCount > 0)
-            parts += "boxSettingsKeys=${unknownBoxSettingsKeyCount}x"
-        logWarn(
-            "[SESSION_SUMMARY] Unknown data received this session ($total total): ${parts.joinToString(", ")}",
-            tag = Logger.Tags.PROTO_UNKNOWN,
-        )
+        callback?.onLogMessage(message)
     }
 }
+

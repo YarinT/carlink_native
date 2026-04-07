@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -v \"^//\")",
+      "Bash(grep -v \"^$\")",
+      "Bash(./gradlew :app:assembleDebug)",
+      "Bash(JAVA_HOME=\"/c/Program Files/Java/jdk-24\" ./gradlew :app:assembleDebug)",
+      "Read(//c/Program Files/**)",
+      "Read(//c/Users/twina/AppData/Local/**)",
+      "Bash(JAVA_HOME=\"/c/Program Files/Java/jdk-24\" ./gradlew :app:assembleDebug -Porg.gradle.java.installations.auto-download=false --no-daemon)",
+      "Bash(gh api:*)",
+      "Bash(python3 -c \"import json,sys; data=json.load\\(sys.stdin\\); [print\\(f['name'], f['type'], f.get\\('size',0\\)\\) for f in data]\")",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(python3 -c ':*)",
+      "Bash(python3)",
+      "Bash(python3 -c \"data=open\\('c:/Users/twina/Documents/carlink_native/app/src/main/kotlin/com/carlink/CarlinkManager.kt',encoding='utf-8'\\).read\\(\\); print\\('gnss' in data.lower\\(\\), 'gps' in data.lower\\(\\), 'GnssForwarder' in data\\)\")",
+      "Bash(JAVA_HOME=\"/c/Program Files/Java/jdk-24\" ./gradlew :app:compileDebugKotlin)",
+      "Bash(winget search:*)",
+      "Bash(\"/c/Users/twina/AppData/Local/Programs/Android Studio/jbr/bin/java\" -version)",
+      "Bash(\"/c/Program Files/Android/Android Studio/jbr/bin/java\" -version)",
+      "Bash(JAVA_HOME=\"/c/Program Files/Android/Android Studio/jbr\" ./gradlew :app:compileDebugKotlin)",
+      "Read(//c/Users/twina/**)",
+      "Bash(echo \"sdk.dir=C\\\\:\\\\\\\\Users\\\\\\\\twina\\\\\\\\AppData\\\\\\\\Local\\\\\\\\Android\\\\\\\\Sdk\")",
+      "Bash(printf 'sdk.dir=C\\\\\\\\:\\\\\\\\\\\\\\\\Users\\\\\\\\\\\\\\\\twina\\\\\\\\\\\\\\\\AppData\\\\\\\\\\\\\\\\Local\\\\\\\\\\\\\\\\Android\\\\\\\\\\\\\\\\Sdk\\\\n')",
+      "Bash(JAVA_HOME=\"/c/Program Files/Android/Android Studio/jbr\" ./gradlew :app:compileDebugKotlin --stacktrace)",
+      "Bash(python3 -c \"print\\(open\\('local.properties'\\).read\\(\\)\\)\")",
+      "Bash(ANDROID_HOME=\"/c/Users/twina/AppData/Local/Android/Sdk\" JAVA_HOME=\"/c/Program Files/Android/Android Studio/jbr\" ./gradlew :app:compileDebugKotlin)",
+      "Bash(ANDROID_HOME=\"/c/Users/twina/AppData/Local/Android/Sdk\" JAVA_HOME=\"/c/Program Files/Android/Android Studio/jbr\" ./gradlew :app:compileDebugKotlin --info)",
+      "Bash(printf 'sdk.dir=C:/Users/twina/AppData/Local/Android/Sdk\\\\n')",
+      "Bash(JAVA_HOME=\"/c/Program Files/Android/Android Studio/jbr\" ./gradlew :app:assembleDebug)"
+    ]
+  }
+}
