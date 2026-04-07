@@ -9,7 +9,7 @@ android {
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.werksmangm.cpaaplayer"
+        applicationId = "com.yarint.carplayv2"
         minSdk = 32
         targetSdk = 36
         versionCode = 61
